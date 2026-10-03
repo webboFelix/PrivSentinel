@@ -1,0 +1,5 @@
+# PrivSentinel
+
+> SentinelFace is a Windows desktop security application designed to protect an active computer session from unauthorized access. The system uses local facial verification, liveness checks, real-time webcam monitoring, visual alerts, voice guidance, and automatic workstation locking to help ensure that the enrolled device owner remains present during an active session.
+Unlike standard facial-login systems that verify a user only during sign-in, SentinelFace performs continuous identity monitoring after the user has signed in. If the enrolled user is absent, an unknown person is detected, multiple faces are present, or the camera becomes unavailable, the application initiates a warning process and locks the Windows workstation after a configurable countdown.
+The project will prioritize privacy by processing biometric data locally, storing encrypted facial templates rather than raw facial images where possible, minimizing retained logs, and avoiding cloud-based video or biometric-data storage.
