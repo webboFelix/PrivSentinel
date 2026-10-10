@@ -1,0 +1,215 @@
+# ============================================================
+# PrivSentinel - Python Dependencies
+# Privacy-first continuous workstation protection for Windows
+# Desktop UI: PySide6
+# Recommended Python version: 3.11 (64-bit)
+# ============================================================
+
+
+# -----------------------------
+# DESKTOP USER INTERFACE
+# -----------------------------
+
+PySide6
+# Official Qt 6 Python bindings.
+# Builds the PrivSentinel desktop interface: windows, dialogs,
+# forms, buttons, countdowns, tables, system tray, and layouts.
+
+pyqtgraph>=0.13.7
+# Interactive OpenGL 3D plots, bars, and pie segments.
+
+PyOpenGL>=3.1.7
+# OpenGL backend used by pyqtgraph's 3D widgets.
+
+
+# -----------------------------
+# CAMERA AND IMAGE PROCESSING
+# -----------------------------
+
+opencv-python
+# Captures webcam frames, processes images, draws face boxes,
+# converts image formats, and supports real-time camera preview.
+
+numpy
+# Performs numerical operations on camera frames and face embeddings.
+# Used for cosine similarity calculations and array processing.
+
+#Pillow
+# Loads and processes enrollment photos selected from the computer.
+# Converts images for display inside PySide6 widgets.
+
+
+# -----------------------------
+# FACE DETECTION, RECOGNITION,
+# AND LIVENESS CHECKS
+# -----------------------------
+
+mediapipe
+# Detects faces and facial landmarks.
+# Supports simple liveness checks such as blinking, head movement,
+# face direction, and basic face-mesh analysis.
+
+insightface
+# Generates face embeddings and supports face detection,
+# alignment, and identity verification for enrolled users.
+
+onnxruntime
+# CPU inference engine used to run InsightFace models locally.
+# Use this for the first version; it does not require an NVIDIA GPU.
+
+
+# -----------------------------
+# WINDOWS INTEGRATION AND
+# LOCAL DATA PROTECTION
+# -----------------------------
+
+pywin32
+# Accesses Windows APIs, including Windows DPAPI through win32crypt.
+# Helps protect face templates and enables Windows-specific functions.
+
+cryptography
+# Provides encryption utilities for protected application settings,
+# encrypted exports, application-PIN support, and secure local data.
+
+
+# -----------------------------
+# TEXT-TO-SPEECH: PRIMARY
+# OFFLINE AND PRIVACY-FIRST
+# -----------------------------
+
+pyttsx3
+# Offline text-to-speech using installed Windows voices.
+# Use for security warnings, countdown alerts, enrollment instructions,
+# and status announcements without sending text to the cloud.
+
+
+# -----------------------------
+# SPEECH RECOGNITION: PRIMARY
+# OFFLINE AND PRIVACY-FIRST
+# -----------------------------
+
+vosk
+# Offline speech recognition engine.
+# Use for a limited safe command set such as:
+# "What is my security status?" and "Repeat instruction."
+
+sounddevice
+# Captures microphone audio for Vosk speech recognition.
+# Works well with a PySide6 QThread background listener.
+
+
+# -----------------------------
+# SPEECH RECOGNITION: OPTIONAL
+# CURRENT ONLINE PROTOTYPE
+# -----------------------------
+
+SpeechRecognition
+# Supports microphone speech recognition through multiple engines.
+# Your current prototype uses recognize_google(), which requires internet.
+# [audio] installs microphone support such as PyAudio where available.
+
+gTTS
+# Optional Google Text-to-Speech library.
+# Generates spoken MP3 files using Google Translate TTS.
+# Requires internet; use only for non-sensitive demo/tutorial prompts.
+
+playsound3
+# Plays MP3 files produced by gTTS.
+# Used by your current speech-assistant implementation.
+
+pygame
+# Optional alternative for more reliable MP3/audio playback.
+# Can replace playsound3 if you later need sound controls.
+
+pyaudio
+
+
+# -----------------------------
+# LOCAL DATABASE, REPORTING,
+# AND DATA EXPORT
+# -----------------------------
+
+reportlab
+# Generates PDF reports containing PrivSentinel security events,
+# verification history, lock events, and temporary-access records.
+
+pandas
+# Organizes, filters, summarizes, and exports event-log data.
+
+openpyxl
+# Allows pandas to export local security-event reports to Excel (.xlsx).
+
+
+# -----------------------------
+# OPTIONAL SECURITY AND
+# PERFORMANCE UTILITIES
+# -----------------------------
+
+keyring
+# Stores small app secrets or application tokens in Windows Credential Manager.
+# Do not use this to store the user's actual Windows password.
+
+psutil
+# Monitors CPU, memory, process information, and application performance.
+
+
+# -----------------------------
+# DEVELOPMENT, TESTING,
+# CODE QUALITY
+# -----------------------------
+
+pytest
+# Runs unit tests for face-policy decisions, timers, database operations,
+# encryption functions, and application state transitions.
+
+pytest-cov
+# Measures code-test coverage when using pytest.
+
+black
+# Formats Python code consistently.
+
+ruff
+# Detects common Python issues, unused imports, and style problems.
+
+
+# -----------------------------
+# WINDOWS PACKAGING
+# -----------------------------
+
+pyinstaller
+# Packages PrivSentinel into a Windows executable, such as PrivSentinel.exe.
+
+watchdog
+# Watches selected folders for create, modify, delete, and rename events.
+# Used for real-time file-integrity monitoring.
+
+yara-python
+# Python interface for compiling YARA rules and scanning files, folders,
+# strings, and processes for suspicious/malware patterns.
+
+pefile
+# Parses Portable Executable files such as .exe and .dll.
+# Supports static analysis of Windows executable metadata and imports.
+
+python-evtx
+# Reads exported Windows Event Log .evtx files.
+# Useful for offline log import and forensic analysis.
+
+pywin32
+# Already included for Windows integration.
+# Use win32evtlog to read live Windows Event Logs.
+
+psutil
+# Already recommended.
+# Helps review running processes, process paths, CPU use, and parent-child process context.
+
+requests
+# Optional.
+# Use only for explicit, hash-only threat-intelligence/VirusTotal lookups.
+
+rich
+# Optional for development/debugging console output.
+# Not required for the PySide6 graphical application.
+
+PyOpenGL 
+PyOpenGL_accelerate
