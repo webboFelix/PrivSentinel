@@ -26,9 +26,13 @@ PyOpenGL>=3.1.7
 # CAMERA AND IMAGE PROCESSING
 # -----------------------------
 
-opencv-python
+opencv-python>=4.11,<5
 # Captures webcam frames, processes images, draws face boxes,
-# converts image formats, and supports real-time camera preview.
+# converts image formats, and supports real-time camera preview. The local face
+# detector requires the Haar cascade asset packaged in this supported release line.
+opencv-contrib-python>=4.11,<5
+# MediaPipe installs this second OpenCV distribution; keep both below 5 so they
+# install compatible cv2 files and cascade assets.
 
 numpy
 # Performs numerical operations on camera frames and face embeddings.

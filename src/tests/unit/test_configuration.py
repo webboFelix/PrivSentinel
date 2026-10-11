@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -45,12 +46,29 @@ def test_settings_persist_across_store_instances(tmp_path):
     path = tmp_path / "PrivSentinel" / "settings.json"
     first_run = SettingsStore(path)
     first_run.load()
-    saved = AppSettings(log_level="DEBUG", log_retention_days=90)
-    first_run.save(saved)
+    saved = first_run.save(
+        AppSettings(log_level="DEBUG", log_retention_days=90, camera_index=7)
+    )
 
     restarted = SettingsStore(path)
     assert restarted.load() == saved
+    assert saved.camera_index == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 0
     assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 4
+
+
+def test_existing_camera_index_is_reset_to_zero(tmp_path):
+    path = tmp_path / "settings.json"
+    raw_settings = AppSettings(camera_index=3)
+    path.write_text(
+        json.dumps(asdict(raw_settings)),
+        encoding="utf-8",
+    )
+
+    settings = SettingsStore(path).load()
+
+    assert settings.camera_index == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 0
 
 
 def test_legacy_version_one_settings_are_migrated(tmp_path):

@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Privacy-first Windows endpoint security platform"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["PySide6>=6.7", "pyqtgraph>=0.13.7", "PyOpenGL>=3.1.7"]
+dependencies = [
+    "PySide6>=6.7",
+    "pyqtgraph>=0.13.7",
+    "PyOpenGL>=3.1.7",
+    "opencv-python>=4.11,<5",
+    "pyttsx3>=2.90",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-qt>=4.4", "ruff>=0.6"]

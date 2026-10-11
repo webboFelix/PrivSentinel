@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -12,9 +11,10 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
+from src.config.defaults import DEFAULT_CAMERA_INDEX
 from src.config.settings import AppSettings
 from src.identity.camera import CameraCapture
-from src.identity.face_detector import FaceDetector, DetectedFace
+from src.identity.face_detector import DetectedFace, FaceDetector, ImageQuality
 from src.identity.face_verifier import FaceRecognitionEngine
 from src.identity.liveness import BasicMotionLiveness
 from src.identity.verification_policy import VerificationPolicy
@@ -47,8 +47,9 @@ class CameraListWorker(QThread):
 
 
 class CameraPreviewWorker(QThread):
-    previewReady = Signal(object, object, object, object)
+    previewReady = Signal(object, object, object, object, object)
     cameraError = Signal(str)
+    status = Signal(str)
 
     def __init__(
         self,
@@ -56,11 +57,12 @@ class CameraPreviewWorker(QThread):
         width: int,
         height: int,
         parent=None,
-        frame_interval_ms: int = 80,
+        frame_interval_ms: int = 120,
         require_single_face: bool = True,
         *,
+        models_directory: str | Path,
+        allow_download: bool = False,
         camera_factory=CameraCapture,
-        detector_factory=FaceDetector,
     ) -> None:
         super().__init__(parent)
         self.camera_index = camera_index
@@ -68,8 +70,9 @@ class CameraPreviewWorker(QThread):
         self.height = height
         self.frame_interval_ms = frame_interval_ms
         self.require_single_face = require_single_face
+        self.models_directory = Path(models_directory)
+        self.allow_download = allow_download
         self.camera_factory = camera_factory
-        self.detector_factory = detector_factory
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -77,36 +80,180 @@ class CameraPreviewWorker(QThread):
 
     def run(self) -> None:
         capture = self.camera_factory(self.camera_index, self.width, self.height)
+        engine = FaceRecognitionEngine(
+            self.models_directory,
+            allow_download=self.allow_download,
+        )
+        model_ready = threading.Event()
+        model_errors: list[RuntimeError] = []
+        model_loader: threading.Thread | None = None
+        preview_frame: np.ndarray | None = None
+
+        def load_model() -> None:
+            try:
+                engine.load()
+            except RuntimeError as exc:
+                model_errors.append(exc)
+            finally:
+                model_ready.set()
+
         try:
-            detector = self.detector_factory()
             capture.open()
+            first_frame = capture.read()
+            preview_frame = first_frame
+            self.previewReady.emit(
+                frame_to_image(first_frame),
+                [],
+                first_frame.copy(),
+                ImageQuality(False, "Face guidance is loading.", 0.0, 0.0),
+                {"camera_check": True},
+            )
+            self.status.emit(
+                "Camera connected. Loading the local face-position model; "
+                "the first download may take several minutes."
+            )
+            model_loader = threading.Thread(
+                target=load_model,
+                name="face-recognition-model-loader",
+            )
+            model_loader.start()
+            while not model_ready.is_set() and not self._stop_event.is_set():
+                frame = capture.read()
+                preview_frame = frame
+                self.previewReady.emit(
+                    frame_to_image(frame),
+                    [],
+                    frame.copy(),
+                    ImageQuality(False, "Face guidance is loading.", 0.0, 0.0),
+                    {"model_loading": True},
+                )
+                self._stop_event.wait(self.frame_interval_ms / 1000)
+            model_loader.join()
+            if self._stop_event.is_set():
+                return
+            if model_errors:
+                raise model_errors[0]
+            if preview_frame is not None:
+                self.previewReady.emit(
+                    frame_to_image(preview_frame),
+                    [],
+                    preview_frame.copy(),
+                    ImageQuality(True, "Face guidance is ready.", 0.0, 0.0),
+                    {"model_ready": True},
+                )
+            eye_cascade_path = (
+                Path(cv2.data.haarcascades) / "haarcascade_eye_tree_eyeglasses.xml"
+            )
+            eye_cascade = cv2.CascadeClassifier(str(eye_cascade_path))
+            if eye_cascade.empty():
+                raise RuntimeError(
+                    f"Could not load eye detector cascade: {eye_cascade_path}"
+                )
             while not self._stop_event.is_set():
                 frame = capture.read()
-                faces = detector.detect(frame)
-                quality = detector.validate_enrollment_frame(
+                observations = engine.analyze(frame)
+                faces = [
+                    DetectedFace(
+                        observation.bounding_box[0],
+                        observation.bounding_box[1],
+                        observation.bounding_box[2] - observation.bounding_box[0],
+                        observation.bounding_box[3] - observation.bounding_box[1],
+                    )
+                    for observation in observations
+                ]
+                quality = FaceDetector.validate_enrollment_frame(
                     frame,
                     faces,
                     require_single_face=self.require_single_face,
                 )
+                guidance = None
+                if len(observations) == 1:
+                    face = observations[0]
+                    pose = engine.estimate_head_pose(
+                        face.landmarks,
+                        frame.shape[1],
+                        frame.shape[0],
+                    )
+                    x, y, width, height = (
+                        faces[0].x,
+                        faces[0].y,
+                        faces[0].width,
+                        faces[0].height,
+                    )
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    eye_region = gray[
+                        max(0, y) : min(gray.shape[0], y + int(height * 0.65)),
+                        max(0, x) : min(gray.shape[1], x + width),
+                    ]
+                    eyes = eye_cascade.detectMultiScale(
+                        eye_region,
+                        scaleFactor=1.1,
+                        minNeighbors=4,
+                        minSize=(max(12, width // 10), max(12, height // 12)),
+                    )
+                    midpoint = eye_region.shape[1] / 2
+                    left_eye = any(eye[0] + eye[2] / 2 < midpoint for eye in eyes)
+                    right_eye = any(eye[0] + eye[2] / 2 >= midpoint for eye in eyes)
+                    guidance = {
+                        "yaw": pose.yaw_degrees,
+                        "pitch": pose.pitch_degrees,
+                        "eyes_open": left_eye and right_eye,
+                        "embedding": face.embedding,
+                    }
                 image = frame_to_image(frame)
-                self.previewReady.emit(image, faces, frame.copy(), quality)
+                self.previewReady.emit(image, faces, frame.copy(), quality, guidance)
                 self._stop_event.wait(self.frame_interval_ms / 1000)
         except Exception as exc:
             if not self._stop_event.is_set():
-                self.cameraError.emit(str(exc))
+                self.cameraError.emit(
+                    f"Camera {self.camera_index} could not provide a live frame: {exc}"
+                )
         finally:
+            if model_loader is not None:
+                model_loader.join()
             capture.release()
 
 
+class SpeechPromptWorker(QThread):
+    completed = Signal()
+    failed = Signal(str)
+
+    def __init__(self, prompt: str, parent=None) -> None:
+        super().__init__(parent)
+        self.prompt = prompt
+
+    def run(self) -> None:
+        engine = None
+        failure = None
+        try:
+            import pyttsx3
+
+            engine = pyttsx3.init()
+            engine.say(self.prompt)
+            engine.runAndWait()
+        except Exception as exc:
+            failure = exc
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            self.failed.emit(str(failure))
+            return
+        self.completed.emit()
+
+
 class EmbeddingWorker(QThread):
-    completed = Signal(object)
+    completed = Signal(object, float)
     failed = Signal(str)
     status = Signal(str)
 
     def __init__(
         self,
         models_directory: str | Path,
-        frame: np.ndarray,
+        frames: np.ndarray | list[np.ndarray],
         parent=None,
         *,
         allow_download: bool = False,
@@ -114,7 +261,9 @@ class EmbeddingWorker(QThread):
     ) -> None:
         super().__init__(parent)
         self.models_directory = Path(models_directory)
-        self.frame = frame.copy()
+        if isinstance(frames, np.ndarray):
+            frames = [frames]
+        self.frames = [frame.copy() for frame in frames]
         self.allow_download = allow_download
         self.require_single_face = require_single_face
 
@@ -125,21 +274,31 @@ class EmbeddingWorker(QThread):
                 self.models_directory,
                 allow_download=self.allow_download,
             )
-            faces = engine.analyze(self.frame)
-            if not faces:
-                raise ValueError(
-                    "The recognition model did not find a face in the captured image."
+            embeddings = []
+            for index, frame in enumerate(self.frames, start=1):
+                self.status.emit(
+                    f"Analyzing sample {index} of {len(self.frames)}…"
                 )
-            if len(faces) > 1 and self.require_single_face:
-                raise ValueError(
-                    "The recognition model found multiple faces; exactly one is required."
+                faces = engine.analyze(frame)
+                if not faces:
+                    raise ValueError(
+                        f"The recognition model did not find a face in sample {index}."
+                    )
+                if len(faces) > 1 and self.require_single_face:
+                    raise ValueError(
+                        f"The recognition model found multiple faces in sample {index}; "
+                        "exactly one is required."
+                    )
+                face = max(
+                    faces,
+                    key=lambda item: max(
+                        0, item.bounding_box[2] - item.bounding_box[0]
+                    )
+                    * max(0, item.bounding_box[3] - item.bounding_box[1]),
                 )
-            face = max(
-                faces,
-                key=lambda item: max(0, item.bounding_box[2] - item.bounding_box[0])
-                * max(0, item.bounding_box[3] - item.bounding_box[1]),
-            )
-            self.completed.emit(face.embedding)
+                embeddings.append(face.embedding)
+            template, consistency = engine.aggregate_embeddings(embeddings)
+            self.completed.emit(template, consistency)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -213,7 +372,7 @@ class CameraMonitorWorker(QThread):
 
         while not self._stop_event.is_set():
             capture = self.camera_factory(
-                self.settings.camera_index,
+                DEFAULT_CAMERA_INDEX,
                 self.settings.camera_width,
                 self.settings.camera_height,
             )

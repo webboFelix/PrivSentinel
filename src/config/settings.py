@@ -7,13 +7,13 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
 from src.config.defaults import (
-    DEFAULT_BACKUP_BEFORE_SAVE,
     DEFAULT_AUTO_LOCK_ENABLED,
+    DEFAULT_BACKUP_BEFORE_SAVE,
     DEFAULT_CAMERA_ACCESS_ENABLED,
     DEFAULT_CAMERA_FAILURE_ACTION,
     DEFAULT_CAMERA_HEIGHT,
@@ -21,18 +21,18 @@ from src.config.defaults import (
     DEFAULT_CAMERA_RECONNECT_SECONDS,
     DEFAULT_CAMERA_WIDTH,
     DEFAULT_CAPTURE_INTERVAL_MS,
-    DEFAULT_FAILURE_LIMIT,
     DEFAULT_ENDPOINT_POLL_INTERVAL_SECONDS,
     DEFAULT_EVENT_RETENTION_DAYS,
-    DEFAULT_FILE_LOGGING_ENABLED,
+    DEFAULT_FAILURE_LIMIT,
     DEFAULT_FILE_INTEGRITY_MONITORING_ENABLED,
+    DEFAULT_FILE_LOGGING_ENABLED,
     DEFAULT_IDENTITY_EVENT_RETENTION_DAYS,
     DEFAULT_IDENTITY_MONITORING_ENABLED,
     DEFAULT_IDENTITY_NOTIFICATIONS_ENABLED,
     DEFAULT_LIVENESS_ENABLED,
+    DEFAULT_LOCK_GRACE_PERIOD_SECONDS,
     DEFAULT_LOG_LEVEL,
     DEFAULT_LOG_RETENTION_DAYS,
-    DEFAULT_LOCK_GRACE_PERIOD_SECONDS,
     DEFAULT_MULTIPLE_FACE_POLICY,
     DEFAULT_NETWORK_MONITORING_ENABLED,
     DEFAULT_PRESENCE_LOSS_ACTION,
@@ -235,6 +235,7 @@ class SettingsStore:
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise SettingsError(f"Could not read settings file {self.path}: {exc}") from exc
             migrated = self._migrate(raw)
+            migrated["camera_index"] = DEFAULT_CAMERA_INDEX
             settings = self._from_mapping(migrated)
             if migrated != raw:
                 self._write(settings)
@@ -242,6 +243,7 @@ class SettingsStore:
 
     def save(self, settings: AppSettings) -> AppSettings:
         with self._lock:
+            settings = replace(settings, camera_index=DEFAULT_CAMERA_INDEX)
             settings.validated()
             if self.path.exists() and settings.backup_before_save:
                 self.backup()
@@ -334,6 +336,7 @@ class SettingsStore:
                     "schema_version": 4,
                 }
             )
+        migrated["camera_index"] = DEFAULT_CAMERA_INDEX
         return migrated
 
     @staticmethod

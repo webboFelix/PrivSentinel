@@ -8,21 +8,22 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
-    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from src.app.dependencies import ApplicationServices
+from src.config.defaults import DEFAULT_CAMERA_INDEX
 from src.config.settings import AppSettings
 from src.ui.components.status_indicator import StatusIndicator
 from src.ui.dialogs.confirmation_dialog import ConfirmationDialog
@@ -85,6 +86,10 @@ class SettingsPage(QWidget):
         self.camera_access = QCheckBox("Allow this app to access a camera")
         self.camera_access.setChecked(services.settings.camera_access_enabled)
         identity_form.addRow("Camera access", self.camera_access)
+        identity_form.addRow(
+            "Camera device",
+            QLabel(f"Camera {DEFAULT_CAMERA_INDEX} (fixed)"),
+        )
         self.identity_monitoring = QCheckBox("Enable continuous identity monitoring")
         self.identity_monitoring.setChecked(
             services.settings.identity_monitoring_enabled
@@ -97,10 +102,6 @@ class SettingsPage(QWidget):
             services.settings.start_monitoring_on_launch
         )
         identity_form.addRow("Startup", self.start_monitoring)
-        self.camera_index = QSpinBox()
-        self.camera_index.setRange(0, 31)
-        self.camera_index.setValue(services.settings.camera_index)
-        identity_form.addRow("Camera device index", self.camera_index)
         self.camera_reconnect = QSpinBox()
         self.camera_reconnect.setRange(1, 60)
         self.camera_reconnect.setSuffix(" seconds")
@@ -427,7 +428,7 @@ class SettingsPage(QWidget):
             log_retention_days=self.retention_days.value(),
             file_logging_enabled=self.file_logging.isChecked(),
             backup_before_save=self.backup_before_save.isChecked(),
-            camera_index=self.camera_index.value(),
+            camera_index=DEFAULT_CAMERA_INDEX,
             camera_reconnect_seconds=self.camera_reconnect.value(),
             camera_failure_action=self.camera_failure_action.currentData(),
             multiple_face_policy=self.multiple_face_policy.currentData(),
@@ -529,7 +530,6 @@ class SettingsPage(QWidget):
         self.camera_access.setChecked(settings.camera_access_enabled)
         self.identity_monitoring.setChecked(settings.identity_monitoring_enabled)
         self.start_monitoring.setChecked(settings.start_monitoring_on_launch)
-        self.camera_index.setValue(settings.camera_index)
         self.camera_reconnect.setValue(settings.camera_reconnect_seconds)
         self.camera_failure_action.setCurrentIndex(
             self.camera_failure_action.findData(settings.camera_failure_action)

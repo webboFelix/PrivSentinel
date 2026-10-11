@@ -3,38 +3,64 @@
 from __future__ import annotations
 
 import sqlite3
+import winsound
 from datetime import UTC, datetime
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QCloseEvent, QPainter, QPen, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from src.app.dependencies import ApplicationServices
-from src.identity.face_detector import ImageQuality
-from src.identity.face_verifier import MODEL_NAME
+from src.config.defaults import DEFAULT_CAMERA_INDEX
+from src.identity.face_detector import DetectedFace, ImageQuality
+from src.identity.face_verifier import MODEL_NAME, FaceRecognitionEngine
 from src.identity.workers import (
-    CameraListWorker,
     CameraPreviewWorker,
-    EmbeddingWorker,
+    SpeechPromptWorker,
 )
 from src.storage.repositories.identity_repository import IdentityRepository
 
 
 class EnrollmentDialog(QDialog):
     enrollmentCompleted = Signal()
+
+    _BASE_SAMPLE_STEPS = (
+        ("Center your face in the frame", "center"),
+        ("Please turn your head to your left", "left"),
+        ("Please turn your head to your right", "right"),
+        ("Please look up", "up"),
+        ("Please look down", "down"),
+        ("Please blink twice", "blink"),
+        ("Please face the camera", "center"),
+        ("Hold still for verification", "center"),
+    )
+    _GLASSES_SAMPLE_STEPS = (
+        ("If you normally wear them, put on your glasses", "center"),
+        ("Now remove your glasses", "center"),
+    )
+    _HIGH_CONSISTENCY_THRESHOLD = 0.85
+    _MODERATE_CONSISTENCY_THRESHOLD = 0.70
+    _POSE_ANGLE_THRESHOLD = 12.0
+    _STABLE_FRAMES_REQUIRED = 5
+    _STABLE_POSE_DELTA_DEGREES = 4.0
+    _STABLE_FACE_SHIFT_RATIO = 0.05
+    _STABLE_FACE_SCALE_DELTA = 0.06
 
     def __init__(
         self,
@@ -46,18 +72,39 @@ class EnrollmentDialog(QDialog):
         self.services = services
         self.repository = repository
         self.setWindowTitle("Identity enrollment")
-        self.setMinimumSize(680, 690)
-        self._devices_worker: CameraListWorker | None = None
+        screen = self.screen()
+        available_geometry = screen.availableGeometry()
+        initial_width = min(760, int(available_geometry.width() * 0.9))
+        initial_height = min(860, int(available_geometry.height() * 0.9))
+        self.setMinimumSize(min(520, initial_width), min(560, initial_height))
+        self.resize(initial_width, initial_height)
         self._preview_worker: CameraPreviewWorker | None = None
-        self._embedding_worker: EmbeddingWorker | None = None
+        self._speech_worker: SpeechPromptWorker | None = None
         self._last_frame: np.ndarray | None = None
-        self._captured_frame: np.ndarray | None = None
-        self._captured_embedding: np.ndarray | None = None
-        self._captured_quality: ImageQuality | None = None
-        self._last_faces = []
+        self._preview_source: QPixmap | None = None
+        self._last_embedding: np.ndarray | None = None
+        self._enrollment_embeddings: list[np.ndarray] = []
+        self._step_index = 0
+        self._enrollment_succeeded = False
+        self._preview_worker_finished = False
+        self._pending_dialog_result: int | None = None
         self._last_quality: ImageQuality | None = None
+        self._camera_discovery_started = False
+        self._speech_ready = False
+        self._stable_frames = 0
+        self._stability_anchor: tuple[float, float, int, int, int, int] | None = None
+        self._blink_count = 0
+        self._eyes_closed_frames = 0
+        self._eyes_open_frames = 0
+        self._blink_armed = False
 
-        layout = QVBoxLayout(self)
+        dialog_layout = QVBoxLayout(self)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(6)
         title = QLabel("Enroll your identity")
         title.setObjectName("sectionTitle")
         intro = QLabel(
@@ -68,33 +115,48 @@ class EnrollmentDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(intro)
+        self.enrollment_summary = QLabel()
+        self.enrollment_summary.setWordWrap(True)
+        self.enrollment_summary.hide()
+        layout.addWidget(self.enrollment_summary)
+
+        self.sequence_label = QLabel()
+        self.sequence_label.setObjectName("muted")
+        self.sequence_label.setWordWrap(True)
+        self.sequence_label.setText(
+            "Enrollment starts after you enter a profile name and consent. Follow the "
+            "spoken and visible instructions; each pose is checked, then sampled "
+            "automatically. Prompts use your local Windows voice. No microphone audio "
+            "is recorded or saved."
+        )
+        layout.addWidget(self.sequence_label)
 
         self.preview = QLabel("Camera is off")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(480, 320)
+        self.preview.setMinimumSize(320, 180)
+        self.preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.preview.setStyleSheet(
             "background:#061326;border:1px solid #163a60;border-radius:8px;"
         )
-        layout.addWidget(self.preview, 1)
-
-        camera_row = QHBoxLayout()
-        self.camera_combo = QComboBox()
-        self.camera_combo.setMinimumWidth(190)
-        self.camera_combo.currentIndexChanged.connect(self._camera_changed)
-        self.refresh_cameras_button = QPushButton("Find cameras")
-        self.refresh_cameras_button.clicked.connect(self._find_cameras)
-        self.start_preview_button = QPushButton("Start camera preview")
-        self.start_preview_button.clicked.connect(self._start_preview)
-        camera_row.addWidget(QLabel("Camera"))
-        camera_row.addWidget(self.camera_combo, 1)
-        camera_row.addWidget(self.refresh_cameras_button)
-        camera_row.addWidget(self.start_preview_button)
-        layout.addLayout(camera_row)
+        self.step_prompt = QLabel()
+        self.step_prompt.setObjectName("sectionTitle")
+        self.step_prompt.setWordWrap(True)
+        self.readiness_indicator = QLabel("Waiting for enrollment consent.")
+        self.readiness_indicator.setObjectName("muted")
+        self.readiness_indicator.setWordWrap(True)
+        self.readiness_progress = QProgressBar()
+        self.readiness_progress.setRange(0, 100)
+        self.readiness_progress.setValue(0)
+        self.readiness_progress.setTextVisible(False)
 
         identity_form = QFormLayout()
         self.display_name = QLineEdit()
         self.display_name.setPlaceholderText("Name for this local profile")
-        identity_form.addRow("Identity name", self.display_name)
+        self.identity_name_label = QLabel("Identity name")
+        identity_form.addRow(self.identity_name_label, self.display_name)
         layout.addLayout(identity_form)
 
         self.consent_checkbox = QCheckBox(
@@ -120,138 +182,162 @@ class EnrollmentDialog(QDialog):
             self.model_download_checkbox.setText(
                 "Recognition model is already installed; no model download is needed."
             )
-        self.confirm_image_checkbox = QCheckBox(
-            "I confirm the captured image is mine and suitable for enrollment."
+        self.glasses_checkbox = QCheckBox(
+            "I normally wear glasses (include glasses-on/off samples)"
         )
-        self.confirm_image_checkbox.setToolTip(
-            "I confirm this captured image is mine and suitable for enrollment."
-        )
+        self.glasses_checkbox.stateChanged.connect(self._update_step_prompt)
         layout.addWidget(self.consent_checkbox)
         layout.addWidget(self.model_download_checkbox)
-        layout.addWidget(self.confirm_image_checkbox)
+        layout.addWidget(self.glasses_checkbox)
         self.enrollment_requirements = QLabel()
         self.enrollment_requirements.setObjectName("muted")
         self.enrollment_requirements.setWordWrap(True)
         layout.addWidget(self.enrollment_requirements)
+        scroll_area.setWidget(content)
+        scroll_area.setMaximumHeight(min(260, int(initial_height * 0.34)))
+        dialog_layout.addWidget(scroll_area)
+        dialog_layout.addWidget(self.step_prompt)
+        dialog_layout.addWidget(self.readiness_indicator)
+        dialog_layout.addWidget(self.readiness_progress)
+        dialog_layout.addWidget(self.preview, 1)
 
         buttons = QHBoxLayout()
-        self.capture_button = QPushButton("Capture")
-        self.capture_button.clicked.connect(self._capture)
-        self.retake_button = QPushButton("Retake")
-        self.retake_button.clicked.connect(self._retake)
-        self.enroll_button = QPushButton("Confirm and enroll")
-        self.enroll_button.setObjectName("primaryButton")
-        self.enroll_button.clicked.connect(self._enroll)
         self.close_button = QPushButton("Close")
-        self.close_button.clicked.connect(self.reject)
-        buttons.addWidget(self.capture_button)
-        buttons.addWidget(self.retake_button)
-        buttons.addWidget(self.enroll_button)
+        self.close_button.clicked.connect(self._close_dialog)
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
-        layout.addLayout(buttons)
+        dialog_layout.addLayout(buttons)
         self.status = QLabel(self._initial_status())
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self.confirm_image_checkbox.stateChanged.connect(self._update_enroll_enabled)
-        self.consent_checkbox.stateChanged.connect(self._update_enroll_enabled)
-        self.model_download_checkbox.stateChanged.connect(self._update_enroll_enabled)
-        self.display_name.textChanged.connect(self._update_enroll_enabled)
-        self.capture_button.setEnabled(False)
-        self.enroll_button.setEnabled(False)
-        self.retake_button.setEnabled(False)
-        self.camera_combo.addItem(
-            f"Camera {services.settings.camera_index}",
-            userData=services.settings.camera_index,
-        )
-        self._update_enroll_enabled()
-        if services.settings.camera_access_enabled:
-            QTimer.singleShot(0, self._find_cameras)
+        dialog_layout.addWidget(self.status)
+        self.consent_checkbox.stateChanged.connect(self._maybe_start_enrollment)
+        self.model_download_checkbox.stateChanged.connect(self._maybe_start_enrollment)
+        self.display_name.textChanged.connect(self._update_enroll_requirements)
+        self.display_name.editingFinished.connect(self._maybe_start_enrollment)
+        self.glasses_checkbox.setEnabled(True)
+        self._update_step_prompt()
+        self._update_enroll_requirements()
 
-    def _find_cameras(self) -> None:
+    def _close_dialog(self, *_args) -> None:
+        if self._enrollment_succeeded:
+            self.accept()
+        else:
+            self.reject()
+
+    def done(self, result: int) -> None:
+        if self._pending_dialog_result is None:
+            self._pending_dialog_result = result
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            self._preview_worker.stop()
+            self.status.setText(
+                "Stopping the camera and waiting for background setup before closing…"
+            )
+            self.close_button.setEnabled(False)
+            return
+        if self._speech_worker is not None and self._speech_worker.isRunning():
+            self.status.setText("Finishing the spoken instruction before closing…")
+            self.close_button.setEnabled(False)
+            return
+        self._finish_pending_close()
+
+    def _finish_pending_close(self) -> None:
+        result = self._pending_dialog_result
+        if result is None:
+            return
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            return
+        if self._speech_worker is not None and self._speech_worker.isRunning():
+            return
+        self._pending_dialog_result = None
+        self._enrollment_embeddings.clear()
+        self._last_frame = None
+        self._last_embedding = None
+        self._preview_source = None
+        self.preview.clear()
+        if not self.services.identity_service.is_monitoring:
+            self.services.identity_service.set_camera_state(
+                "idle" if self.services.settings.camera_access_enabled else "disabled",
+                "Enrollment camera session is not active.",
+            )
+        super().done(result)
+
+    def _sample_steps(self) -> tuple[tuple[str, str], ...]:
+        glasses_steps = (
+            self._GLASSES_SAMPLE_STEPS if self.glasses_checkbox.isChecked() else ()
+        )
+        return (
+            *self._BASE_SAMPLE_STEPS[:5],
+            *glasses_steps,
+            *self._BASE_SAMPLE_STEPS[5:],
+        )
+
+    def _update_step_prompt(self, *_args) -> None:
+        steps = self._sample_steps()
+        if self._step_index >= len(steps):
+            self.step_prompt.setText(f"All {len(steps)} samples captured.")
+            return
+        self.step_prompt.setText(
+            f"Sample {self._step_index + 1} of {len(steps)}: "
+            f"{steps[self._step_index][0]}"
+        )
+        if self._camera_discovery_started or self._preview_worker is not None:
+            self.readiness_indicator.setText("Waiting for the required face position.")
+
+    def _maybe_start_enrollment(self, *_args) -> None:
+        self._update_enroll_requirements()
+        if self._camera_discovery_started or self._enrollment_succeeded:
+            return
         if not self.services.settings.camera_access_enabled:
-            self.status.setText(
-                "Camera access is disabled. Enable it in Settings before searching "
-                "for cameras."
-            )
             return
-        if self.services.identity_service.is_monitoring:
-            self.status.setText(
-                "Stop identity monitoring before starting the enrollment camera preview."
-            )
+        if not self.display_name.text().strip() or not self.consent_checkbox.isChecked():
             return
-        if self._devices_worker is not None and self._devices_worker.isRunning():
+        if (
+            self._model_download_consent_required
+            and not self.model_download_checkbox.isChecked()
+        ):
             return
-        self.status.setText("Searching for available cameras…")
-        worker = CameraListWorker(self)
-        self._devices_worker = worker
-        worker.devicesReady.connect(self._camera_list_ready)
-        worker.failed.connect(self._camera_list_failed)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._camera_discovery_started = True
+        for widget in (
+            self.display_name,
+            self.consent_checkbox,
+            self.model_download_checkbox,
+            self.glasses_checkbox,
+        ):
+            widget.setEnabled(False)
+        self._start_preview()
+
+    def _update_enroll_requirements(self) -> None:
+        requirements = []
+        if not self.services.settings.camera_access_enabled:
+            requirements.append("enable camera access in Settings")
+        if not self.display_name.text().strip():
+            requirements.append("enter an identity name")
+        if not self.consent_checkbox.isChecked():
+            requirements.append("consent to local encrypted face-template enrollment")
+        if (
+            self._model_download_consent_required
+            and not self.model_download_checkbox.isChecked()
+        ):
+            requirements.append("consent to download the local recognition model")
+        self.enrollment_requirements.setText(
+            "Ready to start guided enrollment."
+            if not requirements
+            else "To begin: " + "; ".join(requirements) + "."
+        )
 
     def _initial_status(self) -> str:
         if not self.services.settings.camera_access_enabled:
             return "Camera access is disabled in Settings. Enable it before enrollment."
         return (
-            "Camera access is enabled in Settings. Camera discovery will start "
-            "automatically. The recognition model may also need explicit download "
-            "consent."
+            "Enter an identity name and give consent to begin guided enrollment. "
+            "No face samples are taken before consent."
         )
-
-    def _camera_list_ready(self, devices: list) -> None:
-        selected = self.camera_combo.currentData()
-        self.camera_combo.blockSignals(True)
-        self.camera_combo.clear()
-        for device in devices:
-            self.camera_combo.addItem(device.label, userData=device.index)
-        if not devices:
-            fallback_index = (
-                selected
-                if selected is not None
-                else self.services.settings.camera_index
-            )
-            self.camera_combo.addItem(
-                f"Configured camera {fallback_index} (direct connection test)",
-                userData=fallback_index,
-            )
-        if selected is not None:
-            index = self.camera_combo.findData(selected)
-            if index >= 0:
-                self.camera_combo.setCurrentIndex(index)
-        self.camera_combo.blockSignals(False)
-        if devices:
-            self.status.setText(
-                f"Found {len(devices)} camera device(s); starting the selected preview."
-            )
-        else:
-            self.status.setText(
-                "No device was enumerated. Trying the configured camera directly "
-                "because some Windows camera backends do not enumerate reliably."
-            )
-        self._start_preview()
-
-    def _camera_list_failed(self, message: str) -> None:
-        self.status.setText(
-            f"Camera discovery failed ({message}). Trying the configured camera directly."
-        )
-        self.camera_combo.blockSignals(True)
-        self.camera_combo.clear()
-        index = self.services.settings.camera_index
-        self.camera_combo.addItem(
-            f"Configured camera {index} (direct connection test)",
-            userData=index,
-        )
-        self.camera_combo.blockSignals(False)
-        self._start_preview()
-
-    def _camera_changed(self, _index: int) -> None:
-        if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.stop()
-            self._preview_worker.finished.connect(self._start_preview)
 
     def _start_preview(self) -> None:
+        if self._step_index >= len(self._sample_steps()):
+            self._complete_enrollment()
+            return
         if not self.services.settings.camera_access_enabled:
             self.status.setText(
                 "Enable camera access in Settings before starting camera preview."
@@ -264,32 +350,44 @@ class EnrollmentDialog(QDialog):
             return
         if self._preview_worker and self._preview_worker.isRunning():
             return
-        camera_index = self.camera_combo.currentData()
-        if camera_index is None:
-            self.status.setText("No camera is selected.")
-            return
         settings = self.services.settings
         worker = CameraPreviewWorker(
-            int(camera_index),
+            DEFAULT_CAMERA_INDEX,
             settings.camera_width,
             settings.camera_height,
             self,
             require_single_face=settings.require_single_face,
+            models_directory=self.services.paths.models_directory,
+            allow_download=(
+                self._model_download_consent_required
+                and self.model_download_checkbox.isChecked()
+            ),
         )
         self._preview_worker = worker
+        self._preview_worker_finished = False
         worker.previewReady.connect(self._show_preview)
         worker.cameraError.connect(self._camera_error)
-        worker.finished.connect(self._preview_finished)
-        self.start_preview_button.setEnabled(False)
-        self.status.setText("Opening camera…")
+        worker.status.connect(self.status.setText)
+        worker.finished.connect(
+            lambda worker=worker: self._preview_finished(worker)
+        )
+        worker.finished.connect(worker.deleteLater)
+        self.status.setText(f"Opening camera {DEFAULT_CAMERA_INDEX}…")
         self.services.identity_service.set_camera_state(
             "connecting", "Opening the camera for identity enrollment."
         )
+        self.step_prompt.setText("Preparing local face guidance…")
+        self.readiness_progress.setRange(0, 0)
+        self.readiness_indicator.setText(
+            "Starting the camera and preparing the local recognition model. "
+            "No face samples are captured during setup."
+        )
         worker.start()
 
-    def _preview_finished(self) -> None:
-        self.capture_button.setEnabled(False)
-        self.start_preview_button.setEnabled(True)
+    def _preview_finished(self, worker: CameraPreviewWorker) -> None:
+        if self._preview_worker is worker:
+            self._preview_worker = None
+        self._preview_worker_finished = True
         identity = self.services.identity_service
         if not identity.is_monitoring and identity.camera_state in {
             "connecting",
@@ -298,168 +396,279 @@ class EnrollmentDialog(QDialog):
             identity.set_camera_state(
                 "idle", "Enrollment camera session is not active."
             )
+        QTimer.singleShot(0, self._finish_pending_close)
 
-    def _show_preview(self, image, faces, frame, quality) -> None:
+    def _speak_current_step(self) -> None:
+        if self._step_index >= len(self._sample_steps()):
+            self._complete_enrollment()
+            return
+        instruction, _action = self._sample_steps()[self._step_index]
+        self._speech_ready = False
+        self._stable_frames = 0
+        self._stability_anchor = None
+        self._blink_count = 0
+        self._eyes_closed_frames = 0
+        self._eyes_open_frames = 0
+        self._blink_armed = False
+        self.readiness_progress.setValue(0)
+        self.readiness_indicator.setText("Listening for the requested position…")
+        worker = SpeechPromptWorker(instruction, self)
+        self._speech_worker = worker
+        worker.completed.connect(self._speech_finished)
+        worker.failed.connect(self._speech_failed)
+        worker.finished.connect(
+            lambda worker=worker: self._speech_worker_finished(worker)
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _speech_finished(self) -> None:
+        self._speech_ready = True
+        self.readiness_indicator.setText(
+            "Follow the instruction; the camera will capture automatically."
+        )
+
+    def _speech_failed(self, message: str) -> None:
+        self._speech_ready = True
+        self.readiness_indicator.setText(
+            f"Spoken prompt unavailable ({message}). Follow the visible instruction."
+        )
+
+    def _speech_worker_finished(self, worker: SpeechPromptWorker) -> None:
+        if self._speech_worker is worker:
+            self._speech_worker = None
+        QTimer.singleShot(0, self._finish_pending_close)
+
+    def _show_preview(self, image, faces, frame, quality, guidance) -> None:
+        if self._enrollment_succeeded or self._step_index >= len(self._sample_steps()):
+            return
         self._last_frame = frame
-        self._last_faces = faces
         self._last_quality = quality
         self.services.identity_service.set_camera_state(
-            "connected", "Camera is open for identity enrollment."
+            "connected", "Camera is open for guided identity enrollment."
         )
-        self.capture_button.setEnabled(True)
         pixmap = QPixmap.fromImage(image)
-        if self._captured_frame is None:
-            painter = QPainter(pixmap)
-            painter.setPen(QPen(Qt.GlobalColor.green, 3))
-            for face in faces:
-                painter.drawRect(
-                    face.x,
-                    face.y,
-                    face.width,
-                    face.height,
-                )
-            painter.end()
-            self.preview.setPixmap(
-                pixmap.scaled(
-                    self.preview.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+        painter = QPainter(pixmap)
+        painter.setPen(
+            QPen(
+                Qt.GlobalColor.green
+                if quality.accepted
+                else Qt.GlobalColor.yellow,
+                3,
             )
-        if len(faces) == 0:
-            self.status.setText("No face detected. Center your face in the camera.")
-        elif len(faces) > 1:
-            self.status.setText(
-                f"{len(faces)} faces detected. Enrollment requires one person."
-            )
-        else:
-            self.status.setText(
-                f"One face detected. {quality.detail}"
-            )
+        )
+        for face in faces:
+            painter.drawRect(face.x, face.y, face.width, face.height)
+        painter.end()
+        self._preview_source = pixmap
+        self._render_preview()
 
-    def _capture(self) -> None:
-        if self._last_frame is None:
-            self.status.setText("No camera frame is available to capture.")
+        if guidance is not None and guidance.get("camera_check"):
+            self.step_prompt.setText("Preparing local face guidance…")
+            self.readiness_progress.setRange(0, 0)
+            self.readiness_indicator.setText(
+                f"✓ Camera {DEFAULT_CAMERA_INDEX} is delivering a live image. "
+                "Preparing the local face model; no samples are captured yet."
+            )
             return
-        quality = self._last_quality
-        if quality is None:
-            self.status.setText("Waiting for a face-quality check.")
+        if guidance is not None and guidance.get("model_loading"):
+            self.step_prompt.setText("Preparing local face guidance…")
+            self.readiness_progress.setRange(0, 0)
+            self.readiness_indicator.setText(
+                "Live camera preview is active. Preparing the local face model. "
+                "First-time download can take several minutes; capture starts "
+                "automatically when setup finishes."
+            )
+            return
+        if guidance is not None and guidance.get("model_ready"):
+            self.readiness_progress.setRange(0, 100)
+            self.readiness_progress.setValue(0)
+            self._update_step_prompt()
+            self._speak_current_step()
+            return
+
+        if not faces:
+            self._stable_frames = 0
+            self._stability_anchor = None
+            self.readiness_indicator.setText("No face detected. Center your face.")
+            self.readiness_progress.setValue(0)
+            return
+        if len(faces) != 1 or guidance is None:
+            self._stable_frames = 0
+            self._stability_anchor = None
+            self.readiness_indicator.setText(
+                "Keep only one face in the frame for enrollment."
+            )
+            self.readiness_progress.setValue(0)
             return
         if not quality.accepted:
-            self._captured_frame = None
-            self._captured_quality = quality
-            self.confirm_image_checkbox.setChecked(False)
-            self.enroll_button.setEnabled(False)
-            self.retake_button.setEnabled(False)
-            self.status.setText(quality.detail)
+            self._stable_frames = 0
+            self._stability_anchor = None
+            self.readiness_indicator.setText(
+                f"Adjust your position: {quality.detail}"
+            )
+            self.readiness_progress.setValue(0)
             return
-        self._captured_frame = self._last_frame.copy()
-        self._captured_embedding = None
-        self._captured_quality = quality
-        self.confirm_image_checkbox.setChecked(False)
-        self.retake_button.setEnabled(True)
-        self.enroll_button.setEnabled(False)
-        pixmap = QPixmap.fromImage(self._image_for_frame(self._captured_frame))
+
+        if not self._face_is_stable(faces[0], guidance):
+            self._stable_frames = 0
+            self.readiness_indicator.setText(
+                "Hold still and keep your face in focus; stabilizing the camera…"
+            )
+            self.readiness_progress.setValue(0)
+            return
+
+        self._last_embedding = np.asarray(guidance["embedding"], dtype=np.float32)
+        _instruction, action = self._sample_steps()[self._step_index]
+        ready, progress, detail = self._evaluate_position(action, guidance)
+        self.readiness_indicator.setText(detail)
+        self.readiness_progress.setValue(progress)
+        if not self._speech_ready:
+            return
+        if ready:
+            self._complete_step()
+
+    def _render_preview(self) -> None:
+        if self._preview_source is None or self.preview.size().isEmpty():
+            return
         self.preview.setPixmap(
-            pixmap.scaled(
+            self._preview_source.scaled(
                 self.preview.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
-        self.status.setText(
-            f"Capture accepted: {quality.detail} Review it, confirm the image and consent."
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._render_preview()
+
+    def _face_is_stable(self, face: DetectedFace, guidance: dict) -> bool:
+        current = (
+            float(guidance["yaw"]),
+            float(guidance["pitch"]),
+            face.x,
+            face.y,
+            face.width,
+            face.height,
         )
-        if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.stop()
-        self._update_enroll_enabled()
-        if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.stop()
-            self._last_frame = None
+        anchor = self._stability_anchor
+        if anchor is None:
+            self._stability_anchor = current
+            return False
 
-    @staticmethod
-    def _image_for_frame(frame: np.ndarray):
-        from src.identity.workers import frame_to_image
-
-        return frame_to_image(frame)
-
-    def _update_enroll_enabled(self, *_args) -> None:
-        requirements = []
-        if not self.services.settings.camera_access_enabled:
-            requirements.append("enable camera access in Settings")
-        if self._captured_frame is None:
-            requirements.append("capture an acceptable frame")
-        if not self.confirm_image_checkbox.isChecked():
-            requirements.append("confirm the captured image")
-        if not self.display_name.text().strip():
-            requirements.append("enter an identity name")
-        if not self.consent_checkbox.isChecked():
-            requirements.append("consent to local face-template enrollment")
-        if (
-            self._model_download_consent_required
-            and not self.model_download_checkbox.isChecked()
-        ):
-            requirements.append("consent to download the local recognition model")
-        self.enroll_button.setEnabled(not requirements)
-        self.enroll_button.setToolTip(
-            "Ready to enroll."
-            if not requirements
-            else "Complete these steps to enroll: " + "; ".join(requirements) + "."
+        shift_limit = max(3.0, min(face.width, face.height) * self._STABLE_FACE_SHIFT_RATIO)
+        face_shift = max(
+            abs((face.x + face.width / 2) - (anchor[2] + anchor[4] / 2)),
+            abs((face.y + face.height / 2) - (anchor[3] + anchor[5] / 2)),
         )
-        self.enrollment_requirements.setText(
-            "Ready to enroll."
-            if not requirements
-            else "To enable enrollment: " + "; ".join(requirements) + "."
+        width_change = abs(face.width - anchor[4]) / max(anchor[4], 1)
+        height_change = abs(face.height - anchor[5]) / max(anchor[5], 1)
+        stable = (
+            abs(current[0] - anchor[0]) <= self._STABLE_POSE_DELTA_DEGREES
+            and abs(current[1] - anchor[1]) <= self._STABLE_POSE_DELTA_DEGREES
+            and face_shift <= shift_limit
+            and width_change <= self._STABLE_FACE_SCALE_DELTA
+            and height_change <= self._STABLE_FACE_SCALE_DELTA
         )
+        if not stable:
+            self._stability_anchor = current
+        return stable
 
-    def _retake(self) -> None:
-        self._captured_frame = None
-        self._captured_embedding = None
-        self._captured_quality = None
-        self.confirm_image_checkbox.setChecked(False)
-        self.enroll_button.setEnabled(False)
-        self.retake_button.setEnabled(False)
-        self.status.setText("Capture cleared. Take a new image when ready.")
-        self._last_frame = None
-        if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.finished.connect(self._start_preview)
-            self._preview_worker.stop()
-        else:
-            self._start_preview()
-
-    def _enroll(self) -> None:
-        if not (
-            self._captured_frame is not None
-            and self.consent_checkbox.isChecked()
-            and self.services.settings.camera_access_enabled
-            and (
-                not self._model_download_consent_required
-                or self.model_download_checkbox.isChecked()
+    def _evaluate_position(self, action: str, guidance: dict) -> tuple[bool, int, str]:
+        yaw = float(guidance["yaw"])
+        pitch = float(guidance["pitch"])
+        action_matched = False
+        if action == "center":
+            action_matched = (
+                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
+                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
             )
-            and self.confirm_image_checkbox.isChecked()
-        ):
-            self.status.setText("Capture confirmation, consent, and model consent are required.")
-            return
-        self.enroll_button.setEnabled(False)
-        self.capture_button.setEnabled(False)
-        self.status.setText("Preparing the local recognition model…")
-        worker = EmbeddingWorker(
-            self.services.paths.models_directory,
-            self._captured_frame,
-            self,
-            allow_download=(
-                self._model_download_consent_required
-                and self.model_download_checkbox.isChecked()
-            ),
-            require_single_face=self.services.settings.require_single_face,
-        )
-        self._embedding_worker = worker
-        worker.status.connect(self.status.setText)
-        worker.completed.connect(self._embedding_ready)
-        worker.failed.connect(self._enrollment_failed)
-        worker.start()
+        elif action == "left":
+            action_matched = yaw >= self._POSE_ANGLE_THRESHOLD
+        elif action == "right":
+            action_matched = yaw <= -self._POSE_ANGLE_THRESHOLD
+        elif action == "up":
+            action_matched = pitch <= -self._POSE_ANGLE_THRESHOLD
+        elif action == "down":
+            action_matched = pitch >= self._POSE_ANGLE_THRESHOLD
+        elif action == "blink":
+            action_matched = (
+                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
+                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
+            )
+            if action_matched and guidance["eyes_open"]:
+                if self._blink_armed and self._eyes_closed_frames >= 1:
+                    self._blink_count += 1
+                self._eyes_closed_frames = 0
+                self._eyes_open_frames += 1
+                if self._eyes_open_frames >= 2:
+                    self._blink_armed = True
+            elif action_matched:
+                if self._blink_armed:
+                    self._eyes_closed_frames += 1
+                self._eyes_open_frames = 0
+            else:
+                self._eyes_closed_frames = 0
+                self._eyes_open_frames = 0
+                self._blink_armed = False
+            self._blink_count = min(self._blink_count, 2)
+            percent = self._blink_count * 50
+            if self._blink_count < 2:
+                return False, percent, f"Blink detected: {self._blink_count}/2"
+            action_matched = True
 
-    def _embedding_ready(self, embedding) -> None:
+        if not action_matched:
+            self._stable_frames = 0
+            self.readiness_progress.setValue(0)
+            instruction = self._sample_steps()[self._step_index][0].lower()
+            return False, 0, f"Adjust your position: {instruction}."
+
+        self._stable_frames += 1
+        percent = min(
+            100,
+            self._stable_frames * 100 // self._STABLE_FRAMES_REQUIRED,
+        )
+        if self._stable_frames < self._STABLE_FRAMES_REQUIRED:
+            return False, percent, "✓ Position detected. Hold steady…"
+        return True, 100, "✓ Position confirmed. Capturing automatically."
+
+    def _complete_step(self) -> None:
+        if self._last_embedding is None or self._step_index >= len(self._sample_steps()):
+            return
+        try:
+            winsound.MessageBeep(winsound.MB_OK)
+        except OSError as exc:
+            self.status.setText(f"Capture tone unavailable: {exc}")
+        self._enrollment_embeddings.append(self._last_embedding.copy())
+        self._step_index += 1
+        self._last_embedding = None
+        self._stable_frames = 0
+        self._stability_anchor = None
+        self.readiness_progress.setValue(100)
+        self.readiness_indicator.setText(
+            f"✓ Sample {self._step_index} captured. Moving to the next instruction…"
+        )
+        self._update_step_prompt()
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._speak_current_step()
+
+    def _complete_enrollment(self) -> None:
+        if self._enrollment_succeeded or not self._enrollment_embeddings:
+            return
+        self.status.setText("Creating the encrypted local face template…")
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.stop()
+        try:
+            embedding, consistency = FaceRecognitionEngine.aggregate_embeddings(
+                self._enrollment_embeddings
+            )
+        except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            self._enrollment_failed(str(exc))
+            return
+        self._embedding_ready(embedding, consistency)
+
+    def _embedding_ready(self, embedding, consistency: float) -> None:
         try:
             self.repository.enroll(
                 self.display_name.text(),
@@ -470,45 +679,124 @@ class EnrollmentDialog(QDialog):
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self._enrollment_failed(str(exc))
             return
-        self._captured_frame = None
+        if consistency >= self._HIGH_CONSISTENCY_THRESHOLD:
+            confidence = "High"
+        elif consistency >= self._MODERATE_CONSISTENCY_THRESHOLD:
+            confidence = "Moderate"
+        else:
+            confidence = "Low — retake recommended"
+        self._enrollment_succeeded = True
+        self._enrollment_embeddings.clear()
         self._last_frame = None
-        self.status.setText(
-            "Identity enrolled. The photo was not saved; the template is encrypted."
+        self._last_embedding = None
+        self.status.setText("Enrollment complete.")
+        self.enrollment_summary.setText(
+            "Enrollment complete\n"
+            f"Verification confidence: {confidence}\n"
+            f"Sample consistency: {consistency:.2f} average cosine similarity\n"
+            "Template storage: Encrypted, local device only (Windows DPAPI)\n"
+            "Recovery method: Windows Hello / PIN (same Windows account)"
         )
+        self.enrollment_summary.show()
+        self.enrollment_summary.setToolTip(
+            "Sample consistency is the mean cosine similarity between captured face "
+            "embeddings and their combined template; it is not a probability. "
+            "Labels use fixed sample-consistency bands (High ≥ 0.85, Moderate ≥ 0.70). "
+            "The template is protected by Windows DPAPI for this Windows user. "
+            "PrivSentinel does not store or manage your PIN."
+        )
+        for widget in (
+            self.sequence_label,
+            self.preview,
+            self.step_prompt,
+            self.readiness_indicator,
+            self.readiness_progress,
+            self.identity_name_label,
+            self.display_name,
+            self.consent_checkbox,
+            self.model_download_checkbox,
+            self.glasses_checkbox,
+            self.enrollment_requirements,
+        ):
+            widget.hide()
+        self._preview_source = None
+        self.preview.clear()
+        self.close_button.setText("Done")
         self.enrollmentCompleted.emit()
-        self.accept()
 
     def _enrollment_failed(self, message: str) -> None:
-        self.status.setText(f"Enrollment failed: {message}")
-        self.capture_button.setEnabled(self._last_frame is not None)
-        QMessageBox.warning(self, "Identity enrollment failed", message)
+        self.status.setText("Enrollment could not be completed.")
+        self.readiness_indicator.setText(
+            "No template was saved. Review the error and retry enrollment."
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Identity enrollment failed")
+        box.setText("PrivSentinel could not create the encrypted face template.")
+        box.setInformativeText(
+            "Your temporary face samples remain in memory only and will be cleared "
+            "when you close this dialog. Check the details, then retry or close."
+        )
+        box.setDetailedText(message)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close
+        )
+        if box.exec() == QMessageBox.StandardButton.Retry:
+            self._restart_enrollment()
+
+    def _restart_enrollment(self) -> None:
+        self._enrollment_embeddings.clear()
+        self._step_index = 0
+        self._enrollment_succeeded = False
+        self._speech_ready = False
+        self._update_step_prompt()
+        self._camera_discovery_started = True
+        if self._preview_worker and not self._preview_worker_finished:
+            self._preview_worker.stop()
+            self._preview_worker.finished.connect(self._start_preview)
+        else:
+            self._start_preview()
 
     def _camera_error(self, message: str) -> None:
-        self.status.setText(f"Camera unavailable: {message}")
-        self.capture_button.setEnabled(False)
+        self.readiness_progress.setRange(0, 100)
+        self.readiness_progress.setValue(0)
+        self.status.setText("Guided enrollment stopped: camera or vision setup failed.")
+        self.readiness_indicator.setText(
+            "Check camera access, the recognition-model setup, and OpenCV installation."
+        )
         self.services.identity_service.set_camera_state("unavailable", message)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Guided enrollment cannot continue")
+        box.setText(
+            "PrivSentinel could not access the camera or initialize local face guidance."
+        )
+        box.setInformativeText(
+            f"PrivSentinel opens camera {DEFAULT_CAMERA_INDEX}. Allow desktop-app "
+            "camera access in Windows privacy settings and close other apps using the "
+            "camera. The recognition model will download only after a live camera "
+            "frame is received. No enrollment template was saved."
+        )
+        box.setDetailedText(message)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close
+        )
+        if box.exec() == QMessageBox.StandardButton.Retry:
+            self._camera_discovery_started = True
+            QTimer.singleShot(0, self._start_preview)
+        else:
+            self._camera_discovery_started = False
+            self.reject()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.stop()
-            self._preview_worker.wait(2000)
-        if self._devices_worker and self._devices_worker.isRunning():
-            self._devices_worker.wait(2000)
-        if self._embedding_worker and self._embedding_worker.isRunning():
+        if (
+            self._preview_worker is not None
+            and self._preview_worker.isRunning()
+        ) or (
+            self._speech_worker is not None
+            and self._speech_worker.isRunning()
+        ):
             event.ignore()
-            self.status.setText(
-                "Recognition setup is still running. Close after it finishes."
-            )
-            self.close_button.setEnabled(False)
-            self._embedding_worker.finished.connect(
-                lambda: self.close_button.setEnabled(True)
-            )
+            self.done(self.DialogCode.Rejected)
             return
-        self._captured_frame = None
-        self._last_frame = None
-        if not self.services.identity_service.is_monitoring:
-            self.services.identity_service.set_camera_state(
-                "idle" if self.services.settings.camera_access_enabled else "disabled",
-                "Enrollment camera session is not active.",
-            )
         super().closeEvent(event)
