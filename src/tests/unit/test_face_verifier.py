@@ -31,6 +31,18 @@ def test_aggregate_embeddings_returns_normalized_template_and_consistency():
     assert 0.0 <= consistency <= 1.0
 
 
+def test_best_similarity_matches_either_saved_pose_template():
+    templates = np.asarray(
+        [[1.0, 0.0], [0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+    assert FaceRecognitionEngine.best_similarity(
+        templates,
+        np.asarray([0.0, 1.0], dtype=np.float32),
+    ) == pytest.approx(1.0)
+
+
 def test_recognition_model_is_installed_requires_core_model_files(tmp_path):
     model_directory = tmp_path / "models" / "buffalo_l"
     model_directory.mkdir(parents=True)
@@ -332,8 +344,8 @@ def test_camera_monitor_uses_configured_camera_index(tmp_path):
         def profile(self):
             return SimpleNamespace(model_name="test-model")
 
-        def template(self):
-            return np.ones(32, dtype=np.float32)
+        def templates(self):
+            return np.ones((2, 32), dtype=np.float32)
 
     class FakeEngine:
         def __init__(self, *_args, **_kwargs):

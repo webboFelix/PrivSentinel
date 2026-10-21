@@ -46,16 +46,37 @@ class IdentityRepository:
         )
 
     def template(self) -> np.ndarray | None:
+        templates = self.templates()
+        if templates is None:
+            return None
+        template = templates.mean(axis=0)
+        norm = float(np.linalg.norm(template))
+        if norm == 0:
+            raise ValueError("Stored face templates do not produce a usable template.")
+        return (template / norm).astype(np.float32, copy=False)
+
+    def templates(self) -> np.ndarray | None:
         encrypted = self.secrets.get(self._SECRET_NAME)
         if encrypted is None:
             return None
         try:
-            vector = np.load(io.BytesIO(encrypted), allow_pickle=False)
+            vectors = np.load(io.BytesIO(encrypted), allow_pickle=False)
         except (ValueError, OSError) as exc:
             raise ValueError("Stored face template is invalid or unreadable.") from exc
-        if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+        if vectors.ndim == 1:
+            vectors = vectors[np.newaxis, :]
+        if (
+            vectors.ndim != 2
+            or vectors.shape[0] == 0
+            or vectors.shape[1] < 32
+            or not np.isfinite(vectors).all()
+        ):
             raise ValueError("Stored face template failed validation.")
-        return vector.astype(np.float32, copy=False)
+        vectors = vectors.astype(np.float32, copy=False)
+        norms = np.linalg.norm(vectors, axis=1)
+        if np.any(norms == 0):
+            raise ValueError("Stored face template failed validation.")
+        return vectors / norms[:, np.newaxis]
 
     def enroll(
         self,
@@ -70,18 +91,22 @@ class IdentityRepository:
         details = self._validate_profile_details(profile_details or {})
         if not name or len(name) > 120:
             raise ValueError("Display name must contain between 1 and 120 characters.")
+        if vector.ndim == 1:
+            vector = vector[np.newaxis, :]
         if (
-            vector.ndim != 1
-            or vector.size < 32
+            vector.ndim != 2
+            or vector.shape[0] == 0
+            or vector.shape[1] < 32
             or not np.isfinite(vector).all()
-            or np.linalg.norm(vector) == 0
+            or np.any(np.linalg.norm(vector, axis=1) == 0)
         ):
             raise ValueError("Face embedding must be a finite, non-zero vector.")
         if not model_name or len(model_name) > 120:
             raise ValueError("A valid recognition model name is required.")
         now = datetime.now(timezone.utc)
         stream = io.BytesIO()
-        np.save(stream, vector / np.linalg.norm(vector), allow_pickle=False)
+        normalized = vector / np.linalg.norm(vector, axis=1)[:, np.newaxis]
+        np.save(stream, normalized, allow_pickle=False)
         previous_template = self.secrets.get(self._SECRET_NAME)
         previous_details = self.secrets.get(self._PROFILE_SECRET_NAME)
         try:
@@ -111,7 +136,7 @@ class IdentityRepository:
                         name,
                         now.isoformat(),
                         model_name,
-                        int(vector.size),
+                        int(vector.shape[1]),
                         consent_recorded_at.astimezone(timezone.utc).isoformat(),
                     ),
                 )
@@ -128,7 +153,7 @@ class IdentityRepository:
             name,
             now,
             model_name,
-            int(vector.size),
+            int(vector.shape[1]),
             consent_recorded_at,
             **details,
         )

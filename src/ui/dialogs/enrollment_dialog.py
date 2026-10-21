@@ -62,9 +62,6 @@ class EnrollmentDialog(QDialog):
     _MODERATE_CONSISTENCY_THRESHOLD = 0.70
     _POSE_ANGLE_THRESHOLD = 12.0
     _STABLE_FRAMES_REQUIRED = 5
-    _STABLE_POSE_DELTA_DEGREES = 4.0
-    _STABLE_FACE_SHIFT_RATIO = 0.05
-    _STABLE_FACE_SCALE_DELTA = 0.06
 
     def __init__(
         self,
@@ -88,6 +85,10 @@ class EnrollmentDialog(QDialog):
         self._preview_source: QPixmap | None = None
         self._last_embedding: np.ndarray | None = None
         self._enrollment_embeddings: list[np.ndarray] = []
+        self._pose_embeddings: dict[str, list[np.ndarray]] = {
+            "front": [],
+            "turned": [],
+        }
         self._step_index = 0
         self._enrollment_succeeded = False
         self._setup_failed = False
@@ -97,8 +98,8 @@ class EnrollmentDialog(QDialog):
         self._camera_discovery_started = False
         self._model_preparation_pending = False
         self._speech_ready = False
+        self._speech_prompt_step_index: int | None = None
         self._stable_frames = 0
-        self._stability_anchor: tuple[float, float, int, int, int, int] | None = None
         self._blink_count = 0
         self._eyes_closed_frames = 0
         self._eyes_open_frames = 0
@@ -132,9 +133,9 @@ class EnrollmentDialog(QDialog):
         self.sequence_label.setWordWrap(True)
         self.sequence_label.setText(
             "Enrollment starts after you enter a profile name and consent. Follow the "
-            "spoken and visible instructions; each pose is checked, then sampled "
-            "automatically. Prompts use your local Windows voice. No microphone audio "
-            "is recorded or saved."
+            "spoken and visible instructions, keeping your face inside the fixed oval "
+            "guide; each pose is checked, then sampled automatically. Prompts use your "
+            "local Windows voice. No microphone audio is recorded or saved."
         )
         layout.addWidget(self.sequence_label)
 
@@ -154,10 +155,16 @@ class EnrollmentDialog(QDialog):
         self.readiness_indicator = QLabel("Waiting for enrollment consent.")
         self.readiness_indicator.setObjectName("muted")
         self.readiness_indicator.setWordWrap(True)
+        self.enrollment_progress_label = QLabel(
+            "Enrollment progress: 0% (0 of 8 poses captured)"
+        )
+        self.enrollment_progress_label.setObjectName("muted")
+        self.enrollment_progress_label.setWordWrap(True)
         self.readiness_progress = QProgressBar()
         self.readiness_progress.setRange(0, 100)
         self.readiness_progress.setValue(0)
-        self.readiness_progress.setTextVisible(False)
+        self.readiness_progress.setTextVisible(True)
+        self.readiness_progress.setFormat("Current pose: %p%")
 
         identity_form = QFormLayout()
         self.display_name = QLineEdit()
@@ -236,6 +243,7 @@ class EnrollmentDialog(QDialog):
         dialog_layout.addWidget(scroll_area)
         dialog_layout.addWidget(self.step_prompt)
         dialog_layout.addWidget(self.readiness_indicator)
+        dialog_layout.addWidget(self.enrollment_progress_label)
         dialog_layout.addWidget(self.readiness_progress)
         dialog_layout.addWidget(self.preview, 1)
 
@@ -290,6 +298,8 @@ class EnrollmentDialog(QDialog):
             return
         self._pending_dialog_result = None
         self._enrollment_embeddings.clear()
+        for embeddings in self._pose_embeddings.values():
+            embeddings.clear()
         self._last_frame = None
         self._last_embedding = None
         self._preview_source = None
@@ -315,11 +325,13 @@ class EnrollmentDialog(QDialog):
         steps = self._sample_steps()
         if self._step_index >= len(steps):
             self.step_prompt.setText(f"All {len(steps)} samples captured.")
+            self._set_position_progress(0)
             return
         self.step_prompt.setText(
             f"Sample {self._step_index + 1} of {len(steps)}: "
             f"{steps[self._step_index][0]}"
         )
+        self._set_position_progress(0)
         if self._camera_discovery_started or self._preview_worker is not None:
             self.readiness_indicator.setText("Waiting for the required face position.")
 
@@ -492,16 +504,18 @@ class EnrollmentDialog(QDialog):
         if self._step_index >= len(self._sample_steps()):
             self._complete_enrollment()
             return
-        instruction, _action = self._sample_steps()[self._step_index]
+        if self._speech_worker is not None and self._speech_worker.isRunning():
+            return
+        instruction = self._sample_steps()[self._step_index][0]
         self._speech_ready = False
         self._stable_frames = 0
-        self._stability_anchor = None
         self._blink_count = 0
         self._eyes_closed_frames = 0
         self._eyes_open_frames = 0
         self._blink_armed = False
-        self.readiness_progress.setValue(0)
+        self._set_position_progress(0)
         self.readiness_indicator.setText("Listening for the requested position…")
+        self._speech_prompt_step_index = self._step_index
         worker = SpeechPromptWorker(instruction, self)
         self._speech_worker = worker
         worker.completed.connect(self._speech_finished)
@@ -528,6 +542,12 @@ class EnrollmentDialog(QDialog):
         if self._speech_worker is worker:
             self._speech_worker = None
         QTimer.singleShot(0, self._finish_pending_close)
+        if (
+            self._pending_dialog_result is None
+            and self._speech_prompt_step_index != self._step_index
+            and self._step_index < len(self._sample_steps())
+        ):
+            QTimer.singleShot(0, self._speak_current_step)
 
     def _show_preview(self, image, faces, frame, quality, guidance) -> None:
         if self._enrollment_succeeded or self._step_index >= len(self._sample_steps()):
@@ -537,18 +557,47 @@ class EnrollmentDialog(QDialog):
         self.services.identity_service.set_camera_state(
             "connected", "Camera is open for guided identity enrollment."
         )
+        frame_width = image.width()
+        frame_height = image.height()
+        face_centered = len(faces) == 1 and self._face_centered_in_guide(
+            faces[0],
+            frame_width,
+            frame_height,
+        )
+        position_matches = False
+        if len(faces) == 1 and guidance is not None and not any(
+            guidance.get(state)
+            for state in ("camera_check", "model_loading", "model_ready")
+        ):
+            action = self._sample_steps()[self._step_index][1]
+            position_matches = self._pose_matches(action, guidance)
+        face_ready = face_centered and quality.accepted and position_matches
         pixmap = QPixmap.fromImage(image)
         painter = QPainter(pixmap)
         painter.setPen(
             QPen(
                 Qt.GlobalColor.green
-                if quality.accepted
+                if face_ready
                 else Qt.GlobalColor.yellow,
                 3,
             )
         )
         for face in faces:
             painter.drawRect(face.x, face.y, face.width, face.height)
+        guide_width, guide_height = self._guide_size(frame_width, frame_height)
+        guide_x = (frame_width - guide_width) // 2
+        guide_y = (frame_height - guide_height) // 2
+        painter.setPen(
+            QPen(
+                Qt.GlobalColor.green
+                if face_ready
+                else Qt.GlobalColor.yellow
+                if faces
+                else Qt.GlobalColor.cyan,
+                3,
+            )
+        )
+        painter.drawEllipse(guide_x, guide_y, guide_width, guide_height)
         painter.end()
         self._preview_source = pixmap
         self._render_preview()
@@ -579,44 +628,84 @@ class EnrollmentDialog(QDialog):
 
         if not faces:
             self._stable_frames = 0
-            self._stability_anchor = None
             self.readiness_indicator.setText("No face detected. Center your face.")
-            self.readiness_progress.setValue(0)
+            self._set_position_progress(0)
             return
         if len(faces) != 1 or guidance is None:
             self._stable_frames = 0
-            self._stability_anchor = None
             self.readiness_indicator.setText(
                 "Keep only one face in the frame for enrollment."
             )
-            self.readiness_progress.setValue(0)
+            self._set_position_progress(0)
             return
         if not quality.accepted:
             self._stable_frames = 0
-            self._stability_anchor = None
             self.readiness_indicator.setText(
                 f"Adjust your position: {quality.detail}"
             )
-            self.readiness_progress.setValue(0)
+            self._set_position_progress(0)
             return
 
-        if not self._face_is_stable(faces[0], guidance):
+        if not self._face_centered_in_guide(
+            faces[0],
+            image.width(),
+            image.height(),
+        ):
             self._stable_frames = 0
             self.readiness_indicator.setText(
-                "Hold still and keep your face in focus; stabilizing the camera…"
+                "Move your face into the center of the oval guide."
             )
-            self.readiness_progress.setValue(0)
+            self._set_position_progress(0)
             return
 
         self._last_embedding = np.asarray(guidance["embedding"], dtype=np.float32)
-        _instruction, action = self._sample_steps()[self._step_index]
+        action = self._sample_steps()[self._step_index][1]
         ready, progress, detail = self._evaluate_position(action, guidance)
         self.readiness_indicator.setText(detail)
-        self.readiness_progress.setValue(progress)
-        if not self._speech_ready:
-            return
+        self._set_position_progress(progress)
         if ready:
             self._complete_step()
+
+    def _set_position_progress(self, position_progress: int) -> None:
+        total_steps = len(self._sample_steps())
+        completed_steps = min(self._step_index, total_steps)
+        position_fraction = (
+            0.0
+            if completed_steps >= total_steps
+            else max(0, min(position_progress, 100)) / 100
+        )
+        overall_percent = int(
+            (completed_steps + position_fraction) * 100 / total_steps
+        )
+        self.readiness_progress.setValue(position_progress)
+        self.enrollment_progress_label.setText(
+            f"Enrollment progress: {overall_percent}% "
+            f"({completed_steps} of {total_steps} poses captured)"
+        )
+
+    @staticmethod
+    def _face_centered_in_guide(
+        face: DetectedFace,
+        frame_width: int,
+        frame_height: int,
+    ) -> bool:
+        if frame_width <= 0 or frame_height <= 0:
+            return False
+        guide_width, guide_height = EnrollmentDialog._guide_size(
+            frame_width,
+            frame_height,
+        )
+        center_x = face.x + face.width / 2
+        center_y = face.y + face.height / 2
+        return (
+            abs(center_x - frame_width / 2) <= guide_width * 0.15
+            and abs(center_y - frame_height / 2) <= guide_height * 0.15
+        )
+
+    @staticmethod
+    def _guide_size(frame_width: int, frame_height: int) -> tuple[int, int]:
+        short_side = min(frame_width, frame_height)
+        return int(short_side * 0.58), int(short_side * 0.82)
 
     def _render_preview(self) -> None:
         if self._preview_source is None or self.preview.size().isEmpty():
@@ -633,60 +722,9 @@ class EnrollmentDialog(QDialog):
         super().resizeEvent(event)
         self._render_preview()
 
-    def _face_is_stable(self, face: DetectedFace, guidance: dict) -> bool:
-        current = (
-            float(guidance["yaw"]),
-            float(guidance["pitch"]),
-            face.x,
-            face.y,
-            face.width,
-            face.height,
-        )
-        anchor = self._stability_anchor
-        if anchor is None:
-            self._stability_anchor = current
-            return False
-
-        shift_limit = max(3.0, min(face.width, face.height) * self._STABLE_FACE_SHIFT_RATIO)
-        face_shift = max(
-            abs((face.x + face.width / 2) - (anchor[2] + anchor[4] / 2)),
-            abs((face.y + face.height / 2) - (anchor[3] + anchor[5] / 2)),
-        )
-        width_change = abs(face.width - anchor[4]) / max(anchor[4], 1)
-        height_change = abs(face.height - anchor[5]) / max(anchor[5], 1)
-        stable = (
-            abs(current[0] - anchor[0]) <= self._STABLE_POSE_DELTA_DEGREES
-            and abs(current[1] - anchor[1]) <= self._STABLE_POSE_DELTA_DEGREES
-            and face_shift <= shift_limit
-            and width_change <= self._STABLE_FACE_SCALE_DELTA
-            and height_change <= self._STABLE_FACE_SCALE_DELTA
-        )
-        if not stable:
-            self._stability_anchor = current
-        return stable
-
     def _evaluate_position(self, action: str, guidance: dict) -> tuple[bool, int, str]:
-        yaw = float(guidance["yaw"])
-        pitch = float(guidance["pitch"])
-        action_matched = False
-        if action == "center":
-            action_matched = (
-                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
-                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
-            )
-        elif action == "left":
-            action_matched = yaw >= self._POSE_ANGLE_THRESHOLD
-        elif action == "right":
-            action_matched = yaw <= -self._POSE_ANGLE_THRESHOLD
-        elif action == "up":
-            action_matched = pitch <= -self._POSE_ANGLE_THRESHOLD
-        elif action == "down":
-            action_matched = pitch >= self._POSE_ANGLE_THRESHOLD
-        elif action == "blink":
-            action_matched = (
-                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
-                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
-            )
+        action_matched = self._pose_matches(action, guidance)
+        if action == "blink":
             if action_matched and guidance["eyes_open"]:
                 if self._blink_armed and self._eyes_closed_frames >= 1:
                     self._blink_count += 1
@@ -710,7 +748,6 @@ class EnrollmentDialog(QDialog):
 
         if not action_matched:
             self._stable_frames = 0
-            self.readiness_progress.setValue(0)
             instruction = self._sample_steps()[self._step_index][0].lower()
             return False, 0, f"Adjust your position: {instruction}."
 
@@ -723,6 +760,24 @@ class EnrollmentDialog(QDialog):
             return False, percent, "✓ Position detected. Hold steady…"
         return True, 100, "✓ Position confirmed. Capturing automatically."
 
+    def _pose_matches(self, action: str, guidance: dict) -> bool:
+        yaw = float(guidance["yaw"])
+        pitch = float(guidance["pitch"])
+        if action in {"center", "blink"}:
+            return (
+                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
+                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
+            )
+        if action == "left":
+            return yaw >= self._POSE_ANGLE_THRESHOLD
+        if action == "right":
+            return yaw <= -self._POSE_ANGLE_THRESHOLD
+        if action == "up":
+            return pitch <= -self._POSE_ANGLE_THRESHOLD
+        if action == "down":
+            return pitch >= self._POSE_ANGLE_THRESHOLD
+        return False
+
     def _complete_step(self) -> None:
         if self._last_embedding is None or self._step_index >= len(self._sample_steps()):
             return
@@ -730,12 +785,14 @@ class EnrollmentDialog(QDialog):
             winsound.MessageBeep(winsound.MB_OK)
         except OSError as exc:
             self.status.setText(f"Capture tone unavailable: {exc}")
-        self._enrollment_embeddings.append(self._last_embedding.copy())
+        action = self._sample_steps()[self._step_index][1]
+        pose_group = "turned" if action in {"left", "right"} else "front"
+        sample_embedding = self._last_embedding.copy()
+        self._enrollment_embeddings.append(sample_embedding)
+        self._pose_embeddings[pose_group].append(sample_embedding)
         self._step_index += 1
         self._last_embedding = None
         self._stable_frames = 0
-        self._stability_anchor = None
-        self.readiness_progress.setValue(100)
         self.readiness_indicator.setText(
             f"✓ Sample {self._step_index} captured. Moving to the next instruction…"
         )
@@ -746,17 +803,31 @@ class EnrollmentDialog(QDialog):
     def _complete_enrollment(self) -> None:
         if self._enrollment_succeeded or not self._enrollment_embeddings:
             return
-        self.status.setText("Creating the encrypted local face template…")
+        self.status.setText(
+            "Saving encrypted front-facing and turned-face templates…"
+        )
         if self._preview_worker and self._preview_worker.isRunning():
             self._preview_worker.stop()
         try:
-            embedding, consistency = FaceRecognitionEngine.aggregate_embeddings(
-                self._enrollment_embeddings
+            if any(not embeddings for embeddings in self._pose_embeddings.values()):
+                raise ValueError(
+                    "Enrollment needs both front-facing and turned-face samples."
+                )
+            templates = np.stack(
+                [
+                    FaceRecognitionEngine.aggregate_embeddings(
+                        self._pose_embeddings[group]
+                    )[0]
+                    for group in ("front", "turned")
+                ]
             )
+            consistency = FaceRecognitionEngine.aggregate_embeddings(
+                self._enrollment_embeddings
+            )[1]
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self._enrollment_failed(str(exc))
             return
-        self._embedding_ready(embedding, consistency)
+        self._embedding_ready(templates, consistency)
 
     def _embedding_ready(self, embedding, consistency: float) -> None:
         try:
@@ -783,22 +854,28 @@ class EnrollmentDialog(QDialog):
             confidence = "Low — retake recommended"
         self._enrollment_succeeded = True
         self._enrollment_embeddings.clear()
+        for embeddings in self._pose_embeddings.values():
+            embeddings.clear()
         self._last_frame = None
         self._last_embedding = None
-        self.status.setText("Enrollment complete.")
+        self.status.setText(
+            "Enrollment complete. Front-facing and turned-face templates saved."
+        )
         self.enrollment_summary.setText(
             "Enrollment complete\n"
             f"Verification confidence: {confidence}\n"
             f"Sample consistency: {consistency:.2f} average cosine similarity\n"
+            "Templates: Front-facing and turned-face samples\n"
             "Template storage: Encrypted, local device only (Windows DPAPI)\n"
+            "Camera photos are not saved.\n"
             "Recovery method: Windows Hello / PIN (same Windows account)"
         )
         self.enrollment_summary.show()
         self.enrollment_summary.setToolTip(
             "Sample consistency is the mean cosine similarity between captured face "
-            "embeddings and their combined template; it is not a probability. "
+            "embeddings and their combined verification template; it is not a probability. "
             "Labels use fixed sample-consistency bands (High ≥ 0.85, Moderate ≥ 0.70). "
-            "The template is protected by Windows DPAPI for this Windows user. "
+            "Both pose templates are protected by Windows DPAPI for this Windows user. "
             "PrivSentinel does not store or manage your PIN."
         )
         for widget in (
@@ -806,6 +883,7 @@ class EnrollmentDialog(QDialog):
             self.preview,
             self.step_prompt,
             self.readiness_indicator,
+            self.enrollment_progress_label,
             self.readiness_progress,
             self.identity_name_label,
             self.display_name,
@@ -847,6 +925,8 @@ class EnrollmentDialog(QDialog):
 
     def _restart_enrollment(self) -> None:
         self._enrollment_embeddings.clear()
+        for embeddings in self._pose_embeddings.values():
+            embeddings.clear()
         self._step_index = 0
         self._enrollment_succeeded = False
         self._setup_failed = False

@@ -353,8 +353,8 @@ class CameraMonitorWorker(QThread):
     def run(self) -> None:
         try:
             profile = self.repository.profile()
-            template = self.repository.template()
-            if profile is None or template is None:
+            templates = self.repository.templates()
+            if profile is None or templates is None:
                 self.stateChanged.emit(
                     "verification_failure", "Enroll an identity before monitoring."
                 )
@@ -416,7 +416,10 @@ class CameraMonitorWorker(QThread):
                             if self.settings.liveness_enabled
                             else "disabled"
                         )
-                        confidence = engine.similarity(template, observation.embedding)
+                        confidence = engine.best_similarity(
+                            templates,
+                            observation.embedding,
+                        )
                         if len(observation.landmarks) == 0 and self.settings.liveness_enabled:
                             state = "low_confidence"
                             detail = "Recognition model returned no facial landmarks."

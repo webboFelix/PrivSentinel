@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from io import BytesIO
 
 import numpy as np
 import pytest
@@ -45,7 +46,51 @@ def test_optional_enrollment_details_are_loaded_from_secret_store(tmp_path):
     assert profile.employee_id == "E-123"
     assert profile.machine_user == "ada"
     assert repository.profile() == profile
+    assert repository.templates().shape == (1, 32)
     assert "identity-profile" in secrets.values
+
+
+def test_two_pose_templates_are_encrypted_and_loaded_normalized(tmp_path):
+    secrets = _SecretStore()
+    repository = IdentityRepository(
+        SQLiteDatabase(tmp_path / "local.sqlite3"), secrets
+    )
+    templates = np.stack(
+        [
+            np.arange(1, 33, dtype=np.float32),
+            np.arange(32, 0, -1, dtype=np.float32),
+        ]
+    )
+
+    profile = repository.enroll(
+        "Ada Lovelace",
+        templates,
+        "test-model",
+        datetime.now(UTC),
+    )
+
+    loaded = repository.templates()
+    assert loaded is not None
+    assert loaded.shape == (2, 32)
+    assert np.allclose(np.linalg.norm(loaded, axis=1), 1.0)
+    assert profile.template_dimensions == 32
+    assert repository.template().shape == (32,)
+
+
+def test_legacy_single_template_remains_usable(tmp_path):
+    secrets = _SecretStore()
+    repository = IdentityRepository(
+        SQLiteDatabase(tmp_path / "local.sqlite3"), secrets
+    )
+    legacy_stream = BytesIO()
+    np.save(legacy_stream, np.ones(32, dtype=np.float32), allow_pickle=False)
+    secrets.set("face-template", legacy_stream.getvalue())
+
+    templates = repository.templates()
+
+    assert templates is not None
+    assert templates.shape == (1, 32)
+    assert np.allclose(np.linalg.norm(templates, axis=1), 1.0)
 
 
 def test_enrollment_rejects_invalid_optional_email_before_writing(tmp_path):

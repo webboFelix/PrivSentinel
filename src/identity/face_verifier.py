@@ -205,3 +205,16 @@ class FaceRecognitionEngine:
         if left_norm == 0 or right_norm == 0:
             raise ValueError("Cannot compare an empty face template.")
         return float(np.clip(np.dot(left, right) / (left_norm * right_norm), -1.0, 1.0))
+
+    @classmethod
+    def best_similarity(
+        cls,
+        templates: np.ndarray,
+        embedding: np.ndarray,
+    ) -> float:
+        candidates = np.asarray(templates, dtype=np.float32)
+        if candidates.ndim == 1:
+            candidates = candidates[np.newaxis, :]
+        if candidates.ndim != 2 or candidates.shape[0] == 0:
+            raise ValueError("At least one face template is required.")
+        return max(cls.similarity(candidate, embedding) for candidate in candidates)

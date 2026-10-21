@@ -209,6 +209,51 @@ def test_enrollment_dialog_scales_preview_when_window_resizes(qtbot, tmp_path):
     dialog.reject()
 
 
+def test_enrollment_preview_uses_fixed_oval_and_blocks_off_center_face(
+    qtbot, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    dialog._speech_ready = True
+
+    image = QImage(320, 240, QImage.Format.Format_RGB32)
+    image.fill(0xFFFFFF)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    quality = ImageQuality(True, "Good lighting and focus.", 100.0, 50.0)
+    guidance = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "eyes_open": True,
+        "embedding": np.ones(32, dtype=np.float32),
+    }
+    centered_face = DetectedFace(110, 70, 100, 100)
+
+    dialog._show_preview(image, [centered_face], frame, quality, guidance)
+
+    preview = dialog._preview_source.toImage()
+    assert any(
+        preview.pixelColor(x, y).green() > 200
+        and preview.pixelColor(x, y).red() < 100
+        for x in range(157, 163)
+        for y in range(20, 26)
+    )
+    assert dialog.readiness_progress.value() == 20
+
+    dialog._step_index = 1
+    dialog._show_preview(image, [centered_face], frame, quality, guidance)
+    assert "turn your head to your left" in dialog.readiness_indicator.text()
+    assert dialog.readiness_progress.value() == 0
+
+    off_center_face = DetectedFace(220, 50, 80, 140)
+    dialog._show_preview(image, [off_center_face], frame, quality, guidance)
+
+    assert dialog._step_index == 1
+    assert dialog.readiness_progress.value() == 0
+    assert "center of the oval guide" in dialog.readiness_indicator.text()
+    dialog.reject()
+
+
 def test_dismissing_setup_error_keeps_enrollment_dialog_open(
     qtbot, monkeypatch, tmp_path
 ):
@@ -347,7 +392,8 @@ def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
     dialog = EnrollmentDialog(services, services.identity_repository)
     qtbot.addWidget(dialog)
     dialog.display_name.setText("Local user")
-    dialog.repository.enroll = lambda *args: None
+    enrolled_templates = []
+    dialog.repository.enroll = lambda *args: enrolled_templates.append(args[1].copy())
 
     class FakePreviewWorker(QObject):
         finished = Signal()
@@ -414,16 +460,21 @@ def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
     assert not dialog._enrollment_embeddings
     assert "blurry" in dialog.readiness_indicator.text()
 
-    moving_face = DetectedFace(30, 10, 140, 140)
+    moving_face = DetectedFace(20, 10, 140, 140)
     feed(center_guidance, count=1, sample_face=moving_face)
     assert dialog._step_index == 0
-    assert "stabilizing" in dialog.readiness_indicator.text()
+    assert "Position detected" in dialog.readiness_indicator.text()
 
-    feed(center_guidance)
+    for sample_face in (face, moving_face, face, moving_face, face, moving_face):
+        dialog._show_preview(image, [sample_face], frame, quality, center_guidance)
     assert dialog._step_index == 1
-    feed({**center_guidance, "yaw": 16.0})
+    left_embedding = np.zeros(32, dtype=np.float32)
+    left_embedding[0] = 1.0
+    feed({**center_guidance, "yaw": 16.0, "embedding": left_embedding})
     assert dialog._step_index == 2
-    feed({**center_guidance, "yaw": -16.0})
+    right_embedding = np.zeros(32, dtype=np.float32)
+    right_embedding[1] = 1.0
+    feed({**center_guidance, "yaw": -16.0, "embedding": right_embedding})
     assert dialog._step_index == 3
     feed({**center_guidance, "pitch": -16.0})
     assert dialog._step_index == 4
@@ -439,11 +490,67 @@ def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
     feed(center_guidance)
     feed(center_guidance)
     assert dialog._enrollment_succeeded
+    assert enrolled_templates[0].shape == (2, 32)
+    assert not np.allclose(enrolled_templates[0][0], enrolled_templates[0][1])
     assert len(beeps) == 8
     assert "Enrollment complete" in dialog.enrollment_summary.text()
     assert "Template storage: Encrypted, local device only" in dialog.enrollment_summary.text()
 
     dialog.close_button.click()
+
+
+def test_pose_capture_does_not_wait_for_spoken_prompt(qtbot, monkeypatch, tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+
+    class RunningWorker(QObject):
+        completed = Signal()
+        failed = Signal(str)
+        finished = Signal()
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.running = False
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.enrollment_dialog.SpeechPromptWorker",
+        RunningWorker,
+    )
+    dialog._preview_worker = RunningWorker()
+    dialog._speech_ready = False
+    dialog._speak_current_step()
+
+    image = QImage(320, 240, QImage.Format.Format_RGB32)
+    image.fill(0xFFFFFF)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    quality = ImageQuality(True, "Good lighting and focus.", 100.0, 50.0)
+    guidance = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "eyes_open": True,
+        "embedding": np.ones(32, dtype=np.float32),
+    }
+    face = DetectedFace(110, 70, 100, 100)
+    for _ in range(5):
+        dialog._show_preview(image, [face], frame, quality, guidance)
+
+    assert dialog._step_index == 1
+    assert dialog.enrollment_progress_label.text().startswith(
+        "Enrollment progress: 12%"
+    )
+    dialog._speech_worker.stop()
+    dialog._preview_worker.stop()
+    dialog.reject()
 
 
 def test_dialog_waits_for_camera_worker_before_rejecting(qtbot, tmp_path):
