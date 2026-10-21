@@ -222,7 +222,12 @@ class SettingsPage(QWidget):
         self.lock_grace.setValue(services.settings.lock_grace_period_seconds)
         identity_form.addRow("Lock warning grace period", self.lock_grace)
         self.identity_notifications = QCheckBox(
-            "Show identity verification notifications"
+            "Show identity security notifications"
+        )
+        self.identity_notifications.setToolTip(
+            "Basic liveness heuristic results remain in verification history and "
+            "the Identity Protection status, but do not generate repeated system "
+            "notifications."
         )
         self.identity_notifications.setChecked(
             services.settings.identity_notifications_enabled

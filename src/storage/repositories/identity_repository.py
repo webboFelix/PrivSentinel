@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import json
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -19,6 +22,8 @@ class IdentityRepository:
     _PROFILE_SECRET_NAME = "identity-profile"
     _PROFILE_FIELDS = frozenset({
         "email",
+        "phone",
+        "profile_image",
         "department",
         "employee_id",
         "machine_user",
@@ -103,7 +108,7 @@ class IdentityRepository:
             raise ValueError("Face embedding must be a finite, non-zero vector.")
         if not model_name or len(model_name) > 120:
             raise ValueError("A valid recognition model name is required.")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stream = io.BytesIO()
         normalized = vector / np.linalg.norm(vector, axis=1)[:, np.newaxis]
         np.save(stream, normalized, allow_pickle=False)
@@ -137,7 +142,7 @@ class IdentityRepository:
                         now.isoformat(),
                         model_name,
                         int(vector.shape[1]),
-                        consent_recorded_at.astimezone(timezone.utc).isoformat(),
+                        consent_recorded_at.astimezone(UTC).isoformat(),
                     ),
                 )
         except BaseException as exc:
@@ -194,6 +199,8 @@ class IdentityRepository:
             raise ValueError("Identity profile fields must be text.")
         limits = {
             "email": 254,
+            "phone": 32,
+            "profile_image": 400_000,
             "department": 120,
             "employee_id": 64,
             "machine_user": 120,
@@ -208,6 +215,18 @@ class IdentityRepository:
             or "." not in email.rsplit("@", 1)[1]
         ):
             raise ValueError("Enter a valid email address.")
+        phone = normalized.get("phone", "")
+        if phone and (
+            not re.fullmatch(r"[+0-9(). -]+", phone)
+            or not 7 <= sum(character.isdigit() for character in phone) <= 15
+        ):
+            raise ValueError("Enter a valid phone number.")
+        image = normalized.get("profile_image", "")
+        if image:
+            try:
+                base64.b64decode(image, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Profile image data is invalid.") from exc
         return {key: normalized.get(key, "") for key in cls._PROFILE_FIELDS}
 
     def _restore_secret(self, name: str, value: bytes | None) -> None:
@@ -226,7 +245,7 @@ class IdentityRepository:
         monitoring_seconds: float = 0.0,
         occurred_at: datetime | None = None,
     ) -> IdentityEvent:
-        when = occurred_at or datetime.now(timezone.utc)
+        when = occurred_at or datetime.now(UTC)
         if confidence is not None and not 0 <= confidence <= 1:
             raise ValueError("Confidence must be between 0 and 1.")
         if not all((event_type, state, liveness)):
@@ -248,7 +267,7 @@ class IdentityRepository:
                 "INSERT INTO identity_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event.id,
-                    event.occurred_at.astimezone(timezone.utc).isoformat(),
+                    event.occurred_at.astimezone(UTC).isoformat(),
                     event.event_type,
                     event.state,
                     event.confidence,
@@ -320,8 +339,8 @@ class IdentityRepository:
     def prune_events(self, retention_days: int) -> int:
         if not 1 <= retention_days <= 3650:
             raise ValueError("Retention must be between 1 and 3650 days.")
-        cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
-        cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+        cutoff = datetime.now(UTC).timestamp() - retention_days * 86400
+        cutoff_iso = datetime.fromtimestamp(cutoff, UTC).isoformat()
         with self.database.transaction() as connection:
             cursor = connection.execute(
                 "DELETE FROM identity_events WHERE occurred_at < ?", (cutoff_iso,)

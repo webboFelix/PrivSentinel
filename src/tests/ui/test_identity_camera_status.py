@@ -1,16 +1,21 @@
+import base64
 from dataclasses import replace
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PySide6.QtCore import QObject, QProcess, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QDialog, QMessageBox
 
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
 from src.identity.face_detector import DetectedFace, ImageQuality
+from src.storage.models import IdentityEvent
 from src.ui.dialogs.enrollment_dialog import EnrollmentDialog
 from src.ui.main_window import MainWindow
+from src.ui.pages.identity_protection import IdentityProtectionPage
 from src.ui.pages.settings import SettingsPage
 
 
@@ -22,7 +27,7 @@ def test_identity_page_distinguishes_permission_from_camera_connection(qtbot, tm
 
     services.save_settings(replace(services.settings, camera_access_enabled=True))
     assert page.camera_status.text() == "Camera permission enabled · camera idle"
-    assert "select Enroll / Re-enroll" in page.camera_status.toolTip()
+    assert "select Enroll to start" in page.camera_status.toolTip()
 
     services.identity_service.set_camera_state("connected", "Camera opened.")
     assert page.camera_status.text() == "Camera: connected"
@@ -35,6 +40,159 @@ def test_identity_page_distinguishes_permission_from_camera_connection(qtbot, tm
     assert page.camera_status.text() == "Camera permission enabled · camera idle"
     assert "verification setup failed" in page.camera_status.toolTip()
 
+    window.close()
+
+
+def test_identity_page_enrollment_button_reflects_profile_state(qtbot, tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    page = IdentityProtectionPage(services)
+    qtbot.addWidget(page)
+
+    assert page.enroll_button.text() == "Enroll"
+    page.enroll_button.click()
+    assert page.identity.profile is None
+
+    services.identity_repository.enroll(
+        "Local user",
+        np.arange(1, 33, dtype=np.float32),
+        "test-model",
+        datetime.now(UTC),
+    )
+    services.identity_service.profileChanged.emit()
+
+    assert page.enroll_button.text() == "Re-enroll"
+    page.deleteLater()
+
+
+def test_enrollment_profile_image_is_normalized_before_storage(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    source = QImage(640, 480, QImage.Format.Format_RGB32)
+    source.fill(0x224466)
+    path = tmp_path / "portrait.png"
+    assert source.save(str(path))
+    monkeypatch.setattr(
+        "src.ui.dialogs.enrollment_dialog.QFileDialog.getOpenFileName",
+        lambda *args: (str(path), "Images"),
+    )
+
+    dialog._choose_profile_image()
+
+    encoded = dialog._profile_image_data
+    assert encoded
+    normalized = QImage.fromData(base64.b64decode(encoded), "JPEG")
+    assert normalized.width() == normalized.height() == 256
+    assert not dialog.profile_image_preview.pixmap().isNull()
+    dialog.reject()
+
+
+def test_reenrollment_requires_admin_auth_and_retains_history(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    services.identity_repository.enroll(
+        "Local user",
+        np.arange(1, 33, dtype=np.float32),
+        "test-model",
+        datetime.now(UTC),
+    )
+    services.identity_repository.record_event(
+        event_type="verification",
+        state="recognized",
+        confidence=0.98,
+        liveness="passed",
+        detail="Recognized in test.",
+    )
+    page = IdentityProtectionPage(services)
+    qtbot.addWidget(page)
+
+    class FakeConfirmationDialog:
+        def __init__(self, *args):
+            self.password_cleared = False
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def credentials(self):
+            return "MACHINE\\admin", "test-password"
+
+        def clear_password(self):
+            self.password_cleared = True
+
+    dialog = FakeConfirmationDialog()
+    monkeypatch.setattr(
+        "src.ui.pages.identity_protection.AdministratorConfirmationDialog",
+        lambda *args: dialog,
+    )
+    monkeypatch.setattr(
+        "src.ui.pages.identity_protection.authenticate_windows_administrator",
+        lambda username, password: False,
+    )
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: None)
+
+    page.enroll_button.click()
+
+    assert services.identity_service.profile is not None
+    assert services.identity_repository.count_events() == 1
+    assert page.enroll_button.text() == "Re-enroll"
+    assert dialog.password_cleared
+
+    monkeypatch.setattr(
+        "src.ui.pages.identity_protection.authenticate_windows_administrator",
+        lambda username, password: True,
+    )
+    actions = []
+    page.actionRequested.connect(actions.append)
+
+    page.enroll_button.click()
+
+    assert services.identity_service.profile is None
+    assert services.identity_repository.count_events() == 1
+    assert actions == ["identity-enrollment"]
+    assert dialog.password_cleared
+    page.deleteLater()
+
+
+def test_liveness_heuristic_does_not_generate_repeated_system_notifications(
+    qtbot, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    services.settings = replace(
+        services.settings,
+        identity_notifications_enabled=True,
+    )
+    window = MainWindow(services)
+    qtbot.addWidget(window)
+    notifications = []
+    window._identity_tray = SimpleNamespace(
+        showMessage=lambda *args: notifications.append(args)
+    )
+
+    def event(state: str, detail: str) -> IdentityEvent:
+        return IdentityEvent(
+            id=state,
+            occurred_at=datetime.now(UTC),
+            event_type=state,
+            state=state,
+            confidence=None,
+            liveness="awaiting_basic_motion",
+            detail=detail,
+        )
+
+    window._identity_event(
+        event(
+            "liveness_failure",
+            "Basic facial-landmark motion was not observed.",
+        )
+    )
+    assert notifications == []
+
+    window._identity_event(event("unknown_face", "Unknown face detected."))
+    assert len(notifications) == 1
+    assert notifications[0][1] == "Unknown face detected."
     window.close()
 
 
@@ -94,6 +252,8 @@ def test_enrollment_starts_after_explicit_consent_and_start(qtbot, monkeypatch, 
     )
 
     dialog.display_name.setText("Local user")
+    dialog._profile_image_data = "dGVzdA=="
+    dialog._update_enroll_requirements()
     dialog.display_name.editingFinished.emit()
     assert not dialog._camera_discovery_started
     dialog.consent_checkbox.setChecked(True)
@@ -353,6 +513,8 @@ def test_enrollment_waits_in_open_dialog_for_startup_model(
     monkeypatch.setattr(dialog, "_start_preview", lambda: starts.append(True))
     dialog.set_model_preparation_pending()
     dialog.display_name.setText("Local user")
+    dialog._profile_image_data = "dGVzdA=="
+    dialog._update_enroll_requirements()
     dialog.consent_checkbox.setChecked(True)
     dialog.model_download_checkbox.setChecked(True)
 
@@ -706,10 +868,12 @@ def test_enrollment_completion_shows_confidence_and_local_storage_details(
         ):
             assert display_name == "Local user"
             assert embedding.shape == (32,)
-            assert profile_details["machine_user"]
+            assert profile_details["phone"] == ""
+            assert profile_details["profile_image"] == "dGVzdA=="
 
     dialog.repository = FakeRepository()
     dialog.display_name.setText("Local user")
+    dialog._profile_image_data = "dGVzdA=="
     dialog._embedding_ready(np.ones(32, dtype=np.float32), 0.9)
 
     summary = dialog.enrollment_summary.text()

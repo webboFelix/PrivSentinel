@@ -23,7 +23,6 @@ from src.app.dependencies import ApplicationServices
 from src.endpoint.host_topology import HostTopologyCollector
 from src.endpoint.process_monitor import ProcessMonitor
 from src.network.connection_monitor import ConnectionMonitor
-from src.ui.components.chart_widget import ChartWidget
 from src.ui.components.dashboard_activity import (
     DashboardLiveFeed,
     DashboardNetworkPanel,
@@ -34,6 +33,7 @@ from src.ui.components.dashboard_summary import (
     DashboardIdentityCard,
     DashboardScoreCard,
     DashboardThreatCard,
+    IdentityVerificationCard,
 )
 from src.ui.components.integrity_activity_chart import FileIntegrityActivityChart
 from src.ui.components.security_alert_chart import SecurityAlertChart
@@ -153,12 +153,9 @@ class DashboardPage(QWidget):
         self.threat_chart.blockIpRequested.connect(self.blockIpRequested)
         self.threat_chart.quarantineRequested.connect(self.quarantineRequested)
         self.threat_chart.pageRequested.connect(self.pageRequested)
-        self.identity_chart = ChartWidget(
-            "Identity Verification",
-            "No identity verification events recorded.",
-            icon="identity-verified.png",
-            color="#18d89b",
-            mode="pie",
+        self.identity_verification_card = IdentityVerificationCard()
+        self.identity_verification_card.viewHistoryRequested.connect(
+            lambda: self.pageRequested.emit("verification-history")
         )
         self.integrity_chart = FileIntegrityActivityChart()
         self.integrity_chart.periodChanged.connect(
@@ -218,7 +215,7 @@ class DashboardPage(QWidget):
 
         grid.addWidget(self.alert_chart, 1, 0, 1, 8)
         grid.addWidget(self.threat_chart, 1, 8, 1, 8)
-        grid.addWidget(self.identity_chart, 2, 0, 1, 4)
+        grid.addWidget(self.identity_verification_card, 2, 0, 1, 4)
         grid.addWidget(self.integrity_chart, 2, 4, 1, 4)
         grid.addWidget(self.feed, 2, 8, 1, 8)
         grid.addWidget(self.network_activity, 3, 0, 1, 8)
@@ -596,13 +593,6 @@ class DashboardPage(QWidget):
                 hourly_severities[bucket][severity] += 1
         self.alert_chart.set_data(hourly, hourly_severities)
 
-        self.identity_chart.set_data(
-            tuple(
-                (str(row["state"]).replace("_", " ").title(), float(row["count"]))
-                for row in identity_counts
-            )
-        )
-
         self.refresh_host_topology()
         self.refresh_integrity_activity()
         self.feed.set_events(events[:8])
@@ -689,6 +679,7 @@ class DashboardPage(QWidget):
         detail: str,
         unknown_faces: int,
         last_event=None,
+        profile_image: str = "",
     ) -> None:
         endpoint_running = any(
             worker.isRunning() for worker in self.services.endpoint_service.workers.values()
@@ -711,9 +702,17 @@ class DashboardPage(QWidget):
             enrolled_name,
             state,
             last_event,
+            profile_image,
+        )
+        self.identity_verification_card.set_identity(
+            enrolled_name,
+            monitoring,
+            state,
+            last_event,
+            profile_image,
         )
         if last_event is not None:
-            self.identity_chart.setToolTip(
+            self.identity_verification_card.setToolTip(
                 f"Last result: {last_event.state.replace('_', ' ').title()} — {detail}"
             )
         self.set_camera_state(
@@ -727,7 +726,9 @@ class DashboardPage(QWidget):
 
     def set_identity_error(self, message: str) -> None:
         self.identity_summary.set_error(f"Identity history unavailable: {message}")
-        self.identity_chart.set_message(f"Identity history unavailable: {message}")
+        self.identity_verification_card.set_error(
+            f"Identity history unavailable: {message}"
+        )
 
     def set_camera_state(self, state: str, detail: str) -> None:
         descriptions = {

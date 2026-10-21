@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from itertools import pairwise
 from typing import ClassVar
 
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -40,10 +42,12 @@ class _SummaryCard(QFrame):
         header.setSpacing(5)
         icon_label = QLabel()
         icon_label.setPixmap(QIcon(icon_path(icon)).pixmap(16, 16))
+        self.icon_label = icon_label
         header.addWidget(icon_label)
         self.title_label = QLabel(title.upper())
         self.title_label.setObjectName("caption")
         header.addWidget(self.title_label, 1)
+        self.header_layout = header
         layout.addLayout(header)
         self.body_widget = QWidget()
         self.body_layout = QHBoxLayout(self.body_widget)
@@ -66,16 +70,68 @@ class _SummaryCard(QFrame):
         self.body_widget.show()
 
 
+def _set_avatar(
+    label: QLabel,
+    image_data: str,
+    display_name: str,
+    size: int,
+    *,
+    circular: bool,
+) -> None:
+    fallback = "".join(part[0] for part in display_name.split() if part)[:2].upper()
+    label.setPixmap(QPixmap())
+    label.setText(fallback or display_name[:1].upper())
+    if not image_data:
+        return
+    try:
+        raw_image = base64.b64decode(image_data, validate=True)
+    except (binascii.Error, ValueError):
+        return
+    image = QImage.fromData(raw_image)
+    if image.isNull():
+        return
+    scaled = image.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    left = (scaled.width() - size) // 2
+    top = (scaled.height() - size) // 2
+    source = QPixmap.fromImage(scaled.copy(left, top, size, size))
+    if circular:
+        result = QPixmap(size, size)
+        result.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(0, 0, size, size)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, source)
+        painter.end()
+        source = result
+    label.setPixmap(source)
+    label.setText("")
+
+
 class DashboardIdentityCard(_SummaryCard):
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Identity Protection", "face-scan.png", parent)
+        super().__init__("Identity Protection", "identity-verified.png", parent)
+        self.title_label.setStyleSheet(
+            "color:#d7e8fa;background:#102b49;border-radius:9px;"
+            "padding:3px 8px;font-weight:700;"
+        )
+        self.shield = QLabel()
+        self.shield.setPixmap(QIcon(icon_path("shield-check.png")).pixmap(22, 22))
+        self.header_layout.addWidget(self.shield)
         self.avatar = QLabel("—")
         self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.avatar.setFixedSize(58, 58)
+        self.avatar.setFixedSize(62, 62)
         self.avatar.setStyleSheet(
-            "color:#e6f0ff;background:#0a2b4d;border:2px solid #18d89b;"
-            "border-radius:29px;font-size:15pt;font-weight:600;"
+            "color:#e6f0ff;background:#0a2b4d;border:2px solid #05d6a2;"
+            "border-radius:31px;font-size:15pt;font-weight:600;"
         )
+        self._avatar_key: tuple[str, str] | None = None
         self.body_layout.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         details = QVBoxLayout()
@@ -85,40 +141,71 @@ class DashboardIdentityCard(_SummaryCard):
         self.name_label = QLabel("Consent-based enrollment required")
         self.name_label.setObjectName("muted")
         self.name_label.setWordWrap(True)
-        self.confidence_label = QLabel("Confidence  —")
+        self.name_label.hide()
+        confidence_row = QHBoxLayout()
+        confidence_row.setSpacing(4)
+        self.confidence_label = QLabel("Confidence")
         self.confidence_label.setObjectName("muted")
-        self.last_verified_label = QLabel("Last verified  —")
+        self.confidence_value_label = QLabel("—")
+        self.confidence_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.confidence_value_label.setStyleSheet(
+            "color:#05d6a2;font-weight:700;"
+        )
+        confidence_row.addWidget(self.confidence_label)
+        confidence_row.addStretch(1)
+        confidence_row.addWidget(self.confidence_value_label)
+        last_verified_row = QHBoxLayout()
+        last_verified_row.setSpacing(4)
+        self.last_verified_label = QLabel("Last verified")
         self.last_verified_label.setObjectName("muted")
+        self.last_verified_value_label = QLabel("—")
+        self.last_verified_value_label.setObjectName("muted")
+        self.last_verified_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        last_verified_row.addWidget(self.last_verified_label)
+        last_verified_row.addStretch(1)
+        last_verified_row.addWidget(self.last_verified_value_label)
         for label in (
             self.state_label,
             self.name_label,
-            self.confidence_label,
-            self.last_verified_label,
         ):
             details.addWidget(label)
+        details.addLayout(confidence_row)
+        details.addLayout(last_verified_row)
         self.body_layout.addLayout(details, 1)
+        self.setMinimumHeight(106)
+        self.setMaximumHeight(135)
 
     def set_identity(
         self,
         display_name: str | None,
         state: str,
         last_event: IdentityEvent | None,
+        profile_image: str = "",
     ) -> None:
         self.clear_error()
         if not display_name:
+            self._avatar_key = None
+            self.avatar.setPixmap(QPixmap())
             self.avatar.setText("—")
+            self.avatar.setToolTip("")
             self.state_label.setText("NOT ENROLLED")
             self.state_label.setStyleSheet("color:#8ea9c8;font-weight:700;")
             self.name_label.setText("Consent-based enrollment required")
-            self.confidence_label.setText("Confidence  —")
-            self.last_verified_label.setText("Last verified  —")
+            self.confidence_value_label.setText("—")
+            self.last_verified_value_label.setText("—")
             return
 
-        initials = "".join(
-            part[0] for part in display_name.split() if part
-        )[:2].upper()
-        self.avatar.setText(initials or display_name[:1].upper())
+        avatar_key = (profile_image, display_name)
+        if avatar_key != self._avatar_key:
+            _set_avatar(self.avatar, profile_image, display_name, 62, circular=True)
+            self._avatar_key = avatar_key
+        self.avatar.setToolTip(display_name)
         self.name_label.setText(display_name)
+        self.name_label.hide()
         current = (
             last_event.state
             if last_event is not None
@@ -132,18 +219,187 @@ class DashboardIdentityCard(_SummaryCard):
             if verified
             else "color:#f5ad32;font-weight:700;"
         )
-        if last_event is not None and last_event.confidence is not None:
-            self.confidence_label.setText(
-                f"Confidence  {last_event.confidence:.1%}"
-            )
-        else:
-            self.confidence_label.setText("Confidence  —")
+        confidence = last_event.confidence if last_event is not None else None
+        self.confidence_value_label.setText(
+            f"{confidence:.1%}" if confidence is not None else "—"
+        )
         if last_event is not None and last_event.state == "recognized":
-            self.last_verified_label.setText(
-                f"Last verified  {_time_ago(last_event.occurred_at)}"
+            self.last_verified_value_label.setText(
+                _time_ago(last_event.occurred_at)
             )
         else:
-            self.last_verified_label.setText("Last verified  —")
+            self.last_verified_value_label.setText("—")
+
+
+class IdentityVerificationCard(QFrame):
+    viewHistoryRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("identityVerificationCard")
+        self.setMinimumHeight(126)
+        self.setMaximumHeight(158)
+        self.setStyleSheet(
+            "QFrame#identityVerificationCard {"
+            "background:#071d36;border:1px solid #17456d;border-radius:10px;}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 8, 9, 7)
+        layout.setSpacing(5)
+
+        header = QHBoxLayout()
+        icon = QLabel()
+        icon.setPixmap(QIcon(icon_path("identity-verified.png")).pixmap(18, 18))
+        header.addWidget(icon)
+        title = QLabel("Identity Verification")
+        title.setStyleSheet("color:#d7e8fa;font-weight:700;")
+        header.addWidget(title, 1)
+        self.live_badge = QLabel("● OFFLINE")
+        self.live_badge.setStyleSheet(
+            "color:#88a3c1;background:#102b49;border:1px solid #244c70;"
+            "border-radius:8px;padding:2px 7px;font-size:8pt;font-weight:700;"
+        )
+        header.addWidget(self.live_badge)
+        layout.addLayout(header)
+
+        content = QHBoxLayout()
+        content.setSpacing(8)
+        self.avatar = QLabel("—")
+        self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.avatar.setFixedSize(52, 52)
+        self.avatar.setStyleSheet(
+            "color:#e6f0ff;background:#0a2b4d;border:1px solid #05d6a2;"
+            "border-radius:5px;font-size:14pt;font-weight:600;"
+        )
+        self._avatar_key: tuple[str, str] | None = None
+        content.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        details = QVBoxLayout()
+        details.setSpacing(1)
+        self.name_label = QLabel("Face Verification")
+        self.name_label.setStyleSheet("color:#c8dcf2;font-size:9pt;")
+        details.addWidget(self.name_label)
+        self.state_label = QLabel("NOT ENROLLED")
+        self.state_label.hide()
+        self.confidence_label = QLabel("—")
+        self.confidence_label.setStyleSheet(
+            "color:#05d6a2;font-size:13pt;font-weight:700;"
+        )
+        details.addWidget(self.confidence_label)
+        self.last_seen_label = QLabel("Last seen  —")
+        self.last_seen_label.setStyleSheet("color:#9ab1ca;font-size:8pt;")
+        details.addWidget(self.last_seen_label)
+
+        self.face_status = QLabel("○  Face detected")
+        self.match_status = QLabel("○  Identity matched")
+        self.motion_status = QLabel("○  Liveness confirmed")
+        for label in (self.face_status, self.match_status, self.motion_status):
+            label.setStyleSheet("color:#8ea9c8;font-size:8pt;")
+        content.addLayout(details, 1)
+        layout.addLayout(content, 1)
+
+        footer = QHBoxLayout()
+        checks = QVBoxLayout()
+        checks.setSpacing(1)
+        for label in (self.face_status, self.match_status, self.motion_status):
+            checks.addWidget(label)
+        footer.addLayout(checks, 1)
+        self.history_button = QPushButton("View History")
+        self.history_button.setObjectName("secondaryButton")
+        self.history_button.setFixedHeight(23)
+        self.history_button.clicked.connect(self.viewHistoryRequested)
+        footer.addWidget(self.history_button)
+        layout.addLayout(footer)
+
+    def set_identity(
+        self,
+        display_name: str | None,
+        monitoring: bool,
+        state: str,
+        last_event: IdentityEvent | None,
+        profile_image: str = "",
+    ) -> None:
+        if not display_name:
+            self._avatar_key = None
+            self.avatar.setPixmap(QPixmap())
+            self.avatar.setText("—")
+            self.name_label.setText("Face Verification")
+            self.state_label.setText("NOT ENROLLED")
+            self.confidence_label.setText("—")
+            self.last_seen_label.setText("Last seen  —")
+            self._set_status(self.face_status, "Face not detected", False)
+            self._set_status(self.match_status, "Identity not verified", False)
+            self._set_status(self.motion_status, "Liveness not confirmed", False)
+            self.live_badge.setText("● OFFLINE")
+            self.live_badge.setStyleSheet(
+                "color:#88a3c1;background:#102b49;border:1px solid #244c70;"
+                "border-radius:8px;padding:2px 7px;font-size:8pt;font-weight:700;"
+            )
+            return
+
+        avatar_key = (profile_image, display_name)
+        if avatar_key != self._avatar_key:
+            _set_avatar(self.avatar, profile_image, display_name, 52, circular=False)
+            self._avatar_key = avatar_key
+        self.name_label.setToolTip(display_name)
+
+        state_value = state.casefold()
+        if last_event is not None:
+            state_value = last_event.state.casefold()
+        verified = state_value == "recognized"
+        label = "VERIFIED" if verified else state_value.replace("_", " ").upper()
+        if not label or label == "STOPPED":
+            label = "ENROLLED"
+        self.state_label.setText(label)
+        self.state_label.setToolTip(label)
+        confidence = last_event.confidence if last_event is not None else None
+        self.confidence_label.setText(
+            f"{confidence:.1%}"
+            if confidence is not None
+            else "—"
+        )
+        self.last_seen_label.setText(
+            f"Last seen  {_time_ago(last_event.occurred_at)}"
+            if last_event is not None and verified
+            else "Last seen  —"
+        )
+
+        face_detected = state_value in {
+            "recognized",
+            "unknown_face",
+            "low_confidence",
+            "liveness_failure",
+        }
+        self._set_status(self.face_status, "Face detected", face_detected)
+        self._set_status(self.match_status, "Identity matched", verified)
+        motion_observed = (
+            last_event is not None
+            and last_event.liveness == "basic_motion_observed"
+        )
+        self._set_status(
+            self.motion_status,
+            "Liveness confirmed" if motion_observed else "Liveness not confirmed",
+            motion_observed,
+        )
+        self.live_badge.setText("● LIVE" if monitoring else "● IDLE")
+        self.live_badge.setStyleSheet(
+            "color:#05d6a2;background:#073d42;border:1px solid #087d78;"
+            "border-radius:8px;padding:2px 7px;font-size:8pt;font-weight:700;"
+            if monitoring
+            else "color:#f5ad32;background:#3a2c16;border:1px solid #71521c;"
+            "border-radius:8px;padding:2px 7px;font-size:8pt;font-weight:700;"
+        )
+
+    @staticmethod
+    def _set_status(label: QLabel, text: str, passed: bool) -> None:
+        marker = "✓" if passed else "○"
+        color = "#05d6a2" if passed else "#8ea9c8"
+        label.setText(f"{marker}  {text}")
+        label.setStyleSheet(f"color:{color};font-size:8pt;")
+
+    def set_error(self, message: str) -> None:
+        self.name_label.setText("Identity status unavailable")
+        self.name_label.setToolTip(message)
 
 
 class _ScoreRing(QWidget):

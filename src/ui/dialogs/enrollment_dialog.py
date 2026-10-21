@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import base64
 import sqlite3
 import winsound
 from datetime import UTC, datetime
-from getpass import getuser
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QPainter, QPen, QPixmap, QResizeEvent
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QImageReader,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -99,6 +107,7 @@ class EnrollmentDialog(QDialog):
         self._speech_ready = False
         self._speech_prompt_step_index: int | None = None
         self._stable_frames = 0
+        self._profile_image_data = ""
 
         dialog_layout = QVBoxLayout(self)
         scroll_area = QScrollArea()
@@ -110,9 +119,8 @@ class EnrollmentDialog(QDialog):
         title = QLabel("Enroll your identity")
         title.setObjectName("sectionTitle")
         intro = QLabel(
-            "Frames are processed locally and kept in memory only. The application "
-            "stores an encrypted face embedding, not the captured photo. Optional "
-            "profile details are encrypted for this Windows account."
+            "Face samples are processed locally. Your selected profile photo and "
+            "contact details are encrypted for this Windows account."
         )
         intro.setObjectName("muted")
         intro.setWordWrap(True)
@@ -163,25 +171,39 @@ class EnrollmentDialog(QDialog):
 
         identity_form = QFormLayout()
         self.display_name = QLineEdit()
+        self.display_name.setMaxLength(120)
         self.display_name.setPlaceholderText("Full name")
-        self.identity_name_label = QLabel("Identity name")
-        self.identity_name_label.setText("Full name")
+        self.identity_name_label = QLabel("Full name")
         identity_form.addRow(self.identity_name_label, self.display_name)
         self.email = QLineEdit()
+        self.email.setMaxLength(254)
         self.email.setPlaceholderText("name@example.com (optional)")
-        identity_form.addRow("Work email (optional)", self.email)
-        self.department = QLineEdit()
-        self.department.setPlaceholderText("Department or team (optional)")
-        identity_form.addRow("Department (optional)", self.department)
-        self.employee_id = QLineEdit()
-        self.employee_id.setPlaceholderText("Employee ID (optional)")
-        identity_form.addRow("Employee ID (optional)", self.employee_id)
-        self.machine_user = QLineEdit(getuser())
-        self.machine_user.setPlaceholderText("Windows account name")
-        identity_form.addRow("Windows account", self.machine_user)
+        identity_form.addRow("Email", self.email)
+        self.phone = QLineEdit()
+        self.phone.setMaxLength(32)
+        self.phone.setPlaceholderText("+1 555 123 4567")
+        identity_form.addRow("Phone", self.phone)
+        self.profile_image_preview = QLabel("Choose a profile image")
+        self.profile_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.profile_image_preview.setFixedSize(72, 72)
+        self.profile_image_preview.setStyleSheet(
+            "color:#8ea9c8;background:#0a2b4d;border:1px dashed #28618e;"
+            "border-radius:36px;font-size:8pt;"
+        )
+        self.profile_image_button = QPushButton("Choose profile image")
+        self.profile_image_button.clicked.connect(self._choose_profile_image)
+        image_row = QWidget()
+        image_layout = QHBoxLayout(image_row)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        image_layout.setSpacing(10)
+        image_layout.addWidget(self.profile_image_preview)
+        image_layout.addWidget(self.profile_image_button)
+        image_layout.addStretch(1)
+        self.profile_image_row = image_row
+        identity_form.addRow("Profile image", image_row)
         self.profile_privacy_note = QLabel(
-            "Profile details are optional and DPAPI-encrypted for this Windows account. "
-            "They are not sent to a server."
+            "Your profile image and contact details are encrypted locally and are "
+            "never uploaded."
         )
         self.profile_privacy_note.setObjectName("muted")
         self.profile_privacy_note.setWordWrap(True)
@@ -254,6 +276,7 @@ class EnrollmentDialog(QDialog):
         dialog_layout.addWidget(self.status)
         self.display_name.textChanged.connect(self._update_enroll_requirements)
         self.email.textChanged.connect(self._update_enroll_requirements)
+        self.phone.textChanged.connect(self._update_enroll_requirements)
         self.glasses_checkbox.setEnabled(True)
         self._update_step_prompt()
         self._update_enroll_requirements()
@@ -354,9 +377,8 @@ class EnrollmentDialog(QDialog):
             self.model_download_checkbox,
             self.glasses_checkbox,
             self.email,
-            self.department,
-            self.employee_id,
-            self.machine_user,
+            self.phone,
+            self.profile_image_button,
         ):
             widget.setEnabled(False)
         self._start_preview()
@@ -392,9 +414,13 @@ class EnrollmentDialog(QDialog):
         if not self.services.settings.camera_access_enabled:
             requirements.append("enable camera access in Settings")
         if not self.display_name.text().strip():
-            requirements.append("enter an identity name")
+            requirements.append("enter your full name")
         if not self._email_is_valid():
             requirements.append("enter a valid email address or leave it blank")
+        if not self._phone_is_valid():
+            requirements.append("enter a valid phone number")
+        if not self._profile_image_data:
+            requirements.append("choose a profile image")
         if not self.consent_checkbox.isChecked():
             requirements.append("consent to local encrypted face-template enrollment")
         if (
@@ -418,17 +444,93 @@ class EnrollmentDialog(QDialog):
         email = self.email.text().strip()
         if not email:
             return True
-        if email.count("@") != 1 or any(character.isspace() for character in email):
+        if (
+            len(email) > 254
+            or email.count("@") != 1
+            or any(character.isspace() for character in email)
+        ):
             return False
         local_part, domain = email.split("@")
         return bool(local_part and "." in domain and not domain.startswith("."))
+
+    def _phone_is_valid(self) -> bool:
+        phone = self.phone.text().strip()
+        if not phone:
+            return True
+        digits = sum(character in "0123456789" for character in phone)
+        return 7 <= digits <= 15 and all(
+            character in "0123456789+(). -" for character in phone
+        )
+
+    def _choose_profile_image(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Choose profile image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
+            return
+
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid():
+            reader.setScaledSize(
+                source_size.scaled(
+                    512,
+                    512,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+            )
+        image = reader.read()
+        if image.isNull():
+            QMessageBox.warning(
+                self,
+                "Invalid profile image",
+                reader.errorString() or "The selected image could not be read.",
+            )
+            return
+
+        side = min(image.width(), image.height())
+        image = image.copy(
+            (image.width() - side) // 2,
+            (image.height() - side) // 2,
+            side,
+            side,
+        ).scaled(
+            256,
+            256,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        buffer_data = QByteArray()
+        buffer = QBuffer(buffer_data)
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            raise OSError("Could not prepare the selected profile image.")
+        try:
+            if not image.save(buffer, "JPEG", 85):
+                raise OSError("Could not encode the selected profile image.")
+        finally:
+            buffer.close()
+        self._profile_image_data = base64.b64encode(buffer_data.data()).decode("ascii")
+        self.profile_image_preview.setText("")
+        self.profile_image_preview.setPixmap(
+            QPixmap.fromImage(image).scaled(
+                self.profile_image_preview.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.profile_image_preview.setToolTip(path)
+        self._update_enroll_requirements()
 
     def _initial_status(self) -> str:
         if not self.services.settings.camera_access_enabled:
             return "Camera access is disabled in Settings. Enable it before enrollment."
         return (
-            "Enter an identity name and give consent to begin guided enrollment. "
-            "No face samples are taken before consent."
+            "Enter your full name, contact details, choose a profile image, and give "
+            "consent to begin. No face samples are taken before consent."
         )
 
     def _start_preview(self) -> None:
@@ -833,9 +935,8 @@ class EnrollmentDialog(QDialog):
                 datetime.now(UTC),
                 {
                     "email": self.email.text(),
-                    "department": self.department.text(),
-                    "employee_id": self.employee_id.text(),
-                    "machine_user": self.machine_user.text(),
+                    "phone": self.phone.text(),
+                    "profile_image": self._profile_image_data,
                 },
             )
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
@@ -883,9 +984,8 @@ class EnrollmentDialog(QDialog):
             self.identity_name_label,
             self.display_name,
             self.email,
-            self.department,
-            self.employee_id,
-            self.machine_user,
+            self.phone,
+            self.profile_image_row,
             self.profile_privacy_note,
             self.consent_checkbox,
             self.model_download_checkbox,

@@ -1,3 +1,4 @@
+import base64
 from datetime import UTC, datetime
 from io import BytesIO
 
@@ -35,6 +36,10 @@ def test_optional_enrollment_details_are_loaded_from_secret_store(tmp_path):
         datetime.now(UTC),
         {
             "email": "ada@example.com",
+            "phone": "+1 (555) 123-4567",
+            "profile_image": base64.b64encode(
+                b"encrypted profile photo"
+            ).decode("ascii"),
             "department": "Research",
             "employee_id": "E-123",
             "machine_user": "ada",
@@ -42,6 +47,10 @@ def test_optional_enrollment_details_are_loaded_from_secret_store(tmp_path):
     )
 
     assert profile.email == "ada@example.com"
+    assert profile.phone == "+1 (555) 123-4567"
+    assert profile.profile_image == base64.b64encode(
+        b"encrypted profile photo"
+    ).decode("ascii")
     assert profile.department == "Research"
     assert profile.employee_id == "E-123"
     assert profile.machine_user == "ada"
@@ -106,6 +115,32 @@ def test_enrollment_rejects_invalid_optional_email_before_writing(tmp_path):
             "test-model",
             datetime.now(UTC),
             {"email": "not-an-email"},
+        )
+
+    assert repository.profile() is None
+    assert secrets.values == {}
+
+
+@pytest.mark.parametrize(
+    ("details", "message"),
+    [
+        ({"phone": "call me"}, "valid phone"),
+        ({"profile_image": "not base64!"}, "Profile image data is invalid"),
+    ],
+)
+def test_enrollment_rejects_invalid_contact_or_image_data(tmp_path, details, message):
+    secrets = _SecretStore()
+    repository = IdentityRepository(
+        SQLiteDatabase(tmp_path / "local.sqlite3"), secrets
+    )
+
+    with pytest.raises(ValueError, match=message):
+        repository.enroll(
+            "Ada Lovelace",
+            np.arange(1, 33, dtype=np.float32),
+            "test-model",
+            datetime.now(UTC),
+            details,
         )
 
     assert repository.profile() is None

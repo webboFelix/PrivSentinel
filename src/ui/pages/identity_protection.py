@@ -6,6 +6,7 @@ from dataclasses import replace
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -16,7 +17,11 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
+from src.security.windows_auth import authenticate_windows_administrator
 from src.storage.models import IdentityEvent
+from src.ui.dialogs.administrator_confirmation_dialog import (
+    AdministratorConfirmationDialog,
+)
 
 
 class IdentityProtectionPage(QWidget):
@@ -60,11 +65,9 @@ class IdentityProtectionPage(QWidget):
         layout.addWidget(profile)
 
         controls = QHBoxLayout()
-        self.enroll_button = QPushButton("Enroll / Re-enroll")
+        self.enroll_button = QPushButton()
         self.enroll_button.setObjectName("primaryButton")
-        self.enroll_button.clicked.connect(
-            lambda: self.actionRequested.emit("identity-enrollment")
-        )
+        self.enroll_button.clicked.connect(self._enroll_or_reenroll)
         self.monitor_button = QPushButton("Start monitoring")
         self.monitor_button.clicked.connect(self._toggle_monitoring)
         self.delete_button = QPushButton("Delete enrolled identity")
@@ -157,6 +160,7 @@ class IdentityProtectionPage(QWidget):
         profile = self.identity.profile
         if profile is None:
             self.profile_label.setText("No identity is enrolled.")
+            self.enroll_button.setText("Enroll")
             self.delete_button.setEnabled(False)
             self.monitor_button.setEnabled(False)
         else:
@@ -164,6 +168,7 @@ class IdentityProtectionPage(QWidget):
                 f"{profile.display_name} · enrolled {profile.enrolled_at.astimezone().strftime('%Y-%m-%d %H:%M %Z')} · "
                 f"{profile.model_name} ({profile.template_dimensions}-dimensional encrypted template)"
             )
+            self.enroll_button.setText("Re-enroll")
             self.delete_button.setEnabled(True)
             self.monitor_button.setEnabled(
                 self.services.settings.camera_access_enabled
@@ -221,29 +226,77 @@ class IdentityProtectionPage(QWidget):
             QMessageBox.critical(self, "Could not start monitoring", str(exc))
 
     def _delete_identity(self) -> None:
-        result = QMessageBox.question(
-            self,
-            "Delete enrolled identity",
-            "Delete the encrypted face template and stop monitoring? "
-            "Verification history will be retained.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if result != QMessageBox.StandardButton.Yes:
+        self._remove_identity(start_enrollment=False)
+
+    def _enroll_or_reenroll(self) -> None:
+        if self.identity.profile is None:
+            self.actionRequested.emit("identity-enrollment")
             return
+        self._remove_identity(start_enrollment=True)
+
+    def _remove_identity(self, start_enrollment: bool) -> None:
+        action = "re-enroll" if start_enrollment else "delete the enrolled identity"
+        dialog = AdministratorConfirmationDialog(
+            f"Confirm {action}",
+            "This permanently removes the encrypted face templates and identity "
+            "profile details. Verification and enrollment history will be retained. "
+            "Camera frames are not stored. Enter credentials for a Windows "
+            "administrator account to continue.",
+            "Verify and continue",
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.clear_password()
+            return
+
+        username, password = dialog.credentials()
+        try:
+            authorized = authenticate_windows_administrator(username, password)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Could not verify administrator credentials",
+                str(exc),
+            )
+            return
+        finally:
+            dialog.clear_password()
+
+        if not authorized:
+            QMessageBox.warning(
+                self,
+                "Administrator verification failed",
+                "The credentials are invalid or the account is not a Windows "
+                "administrator. The identity was not changed.",
+            )
+            return
+
         try:
             if self.identity.is_monitoring:
                 self.services.save_settings(
                     replace(
                         self.services.settings,
-                        camera_access_enabled=False,
                         identity_monitoring_enabled=False,
                         start_monitoring_on_launch=False,
                     )
                 )
-            self.identity.delete_profile()
+                self.identity.stop_monitoring()
+                if self.identity.is_monitoring:
+                    raise RuntimeError(
+                        "Identity monitoring is still shutting down; no identity "
+                        "data was removed."
+                    )
+            if not self.identity.delete_profile():
+                raise RuntimeError(
+                    "The enrolled identity could not be removed; no new enrollment "
+                    "was started."
+                )
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            QMessageBox.critical(self, "Could not delete identity", str(exc))
+            QMessageBox.critical(self, "Could not remove identity", str(exc))
+            return
+
+        if start_enrollment:
+            self.actionRequested.emit("identity-enrollment")
 
     def _refresh(self) -> None:
         self._render_profile()
@@ -297,7 +350,7 @@ class IdentityProtectionPage(QWidget):
         self.camera_status.setText(labels.get(state, "Camera: status unknown"))
         self.camera_status.setToolTip(
             f"{detail} Camera access permission does not open the camera by itself; "
-            "select Enroll / Re-enroll to start the enrollment camera session."
+            f"select {self.enroll_button.text()} to start the enrollment camera session."
             if state == "idle"
             else detail
         )

@@ -747,7 +747,6 @@ class MainWindow(QMainWindow):
         if event.state in {
             "unknown_face",
             "multiple_faces",
-            "liveness_failure",
             "camera_unavailable",
         }:
             self._identity_tray.showMessage(
@@ -789,6 +788,7 @@ class MainWindow(QMainWindow):
             identity.current_detail,
             unknown_faces,
             recent[0] if recent else None,
+            profile.profile_image if profile else "",
         )
 
         endpoint_running = any(

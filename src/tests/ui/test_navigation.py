@@ -1,10 +1,12 @@
+import base64
 import socket
 from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QGridLayout, QMessageBox
 
 from src.app.dependencies import ApplicationServices
@@ -110,12 +112,23 @@ def test_dashboard_populates_charts_and_feed_from_persisted_events(window):
 def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window):
     dashboard = window._pages["dashboard"]
     assert dashboard.identity_summary.state_label.text() == "NOT ENROLLED"
+    assert dashboard.identity_verification_card.state_label.text() == "NOT ENROLLED"
+    assert dashboard.identity_verification_card.live_badge.text() == "● OFFLINE"
     assert dashboard.score_summary.ring._score is None
     assert dashboard.score_summary.risk_label.text() == "NO DATA · ENABLE MONITORS"
     assert dashboard.score_summary.factor_progress["Identity"].value() == 0
     assert dashboard.score_summary.factor_values["Identity"].text() == "N/A"
     assert dashboard.threat_summary.count_label.text() == "0"
     assert dashboard.files_summary.count_label.text() == "0"
+
+    photo = QImage(32, 32, QImage.Format.Format_RGB32)
+    photo.fill(0x336699)
+    photo_data = QByteArray()
+    photo_buffer = QBuffer(photo_data)
+    assert photo_buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert photo.save(photo_buffer, "PNG")
+    photo_buffer.close()
+    profile_image = base64.b64encode(photo_data.data()).decode("ascii")
 
     dashboard.set_identity_state(
         "Local user",
@@ -132,10 +145,26 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
             "passed",
             "Identity matched.",
         ),
+        profile_image,
     )
     assert dashboard.identity_summary.state_label.text() == "VERIFIED"
-    assert dashboard.identity_summary.confidence_label.text() == "Confidence  98.7%"
-    assert dashboard.identity_summary.last_verified_label.text() == "Last verified  0 seconds ago"
+    assert dashboard.identity_summary.confidence_label.text() == "Confidence"
+    assert dashboard.identity_summary.confidence_value_label.text() == "98.7%"
+    assert dashboard.identity_summary.last_verified_label.text() == "Last verified"
+    assert dashboard.identity_summary.last_verified_value_label.text() == "0 seconds ago"
+    assert dashboard.identity_verification_card.state_label.text() == "VERIFIED"
+    assert dashboard.identity_verification_card.confidence_label.text() == "98.7%"
+    assert dashboard.identity_verification_card.last_seen_label.text() == "Last seen  0 seconds ago"
+    assert dashboard.identity_verification_card.face_status.text().endswith("Face detected")
+    assert dashboard.identity_verification_card.match_status.text().endswith("Identity matched")
+    assert dashboard.identity_verification_card.motion_status.text().endswith(
+        "Liveness not confirmed"
+    )
+    assert not dashboard.identity_summary.avatar.pixmap().isNull()
+    assert not dashboard.identity_verification_card.avatar.pixmap().isNull()
+
+    dashboard.identity_verification_card.history_button.click()
+    assert window.current_page_key == "verification-history"
 
     with window.services.database.transaction() as connection:
         connection.execute(

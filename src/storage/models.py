@@ -15,6 +15,8 @@ class IdentityProfile:
     department: str = ""
     employee_id: str = ""
     machine_user: str = ""
+    phone: str = ""
+    profile_image: str = ""
 
 
 @dataclass(frozen=True, slots=True)
