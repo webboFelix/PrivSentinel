@@ -6,9 +6,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
+
+from src.security.windows_auth import authenticate_windows_administrator
 
 
 class AdministratorConfirmationDialog(QDialog):
@@ -51,3 +54,43 @@ class AdministratorConfirmationDialog(QDialog):
 
     def clear_password(self) -> None:
         self.password_input.clear()
+
+
+def confirm_windows_administrator(
+    parent: QWidget,
+    title: str,
+    message: str,
+    confirm_text: str = "Verify and continue",
+) -> bool:
+    dialog = AdministratorConfirmationDialog(
+        title,
+        message,
+        confirm_text,
+        parent,
+    )
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog.clear_password()
+        return False
+
+    username, password = dialog.credentials()
+    try:
+        authorized = authenticate_windows_administrator(username, password)
+    except OSError as exc:
+        QMessageBox.critical(
+            parent,
+            "Could not verify administrator credentials",
+            str(exc),
+        )
+        return False
+    finally:
+        dialog.clear_password()
+
+    if not authorized:
+        QMessageBox.warning(
+            parent,
+            "Administrator verification failed",
+            "The credentials are invalid or the account is not a Windows "
+            "administrator. No changes were made.",
+        )
+        return False
+    return True

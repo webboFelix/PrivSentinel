@@ -75,6 +75,123 @@ def test_global_search_submission_emits_query(qtbot):
     assert signal.args == ["network"]
 
 
+def test_global_search_includes_local_events_and_files(qtbot, monkeypatch, window):
+    window.services.event_pipeline.publish(
+        SecurityEvent(
+            source="test-source",
+            event_type="test_event",
+            severity="low",
+            description="needle event",
+        )
+    )
+    with window.services.database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO file_integrity_baselines "
+            "(path, sha256, modified_ns, size, captured_at) VALUES (?, ?, ?, ?, ?)",
+            ("C:\\needle.txt", "hash", 1, 10, "2026-10-21T00:00:00+00:00"),
+        )
+
+    captured = {}
+
+    class SearchDialog:
+        DialogCode = type("DialogCode", (), {"Accepted": 1})
+
+        def __init__(self, query, pages, parent, records):
+            captured["records"] = records
+            self.selected_key = None
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr("src.ui.main_window.SearchResultsDialog", SearchDialog)
+    window._search_pages("needle")
+
+    assert any("EVENT" in record[0] and "needle event" in record[0] for record in captured["records"])
+    assert any("FILE" in record[0] and "needle.txt" in record[0] for record in captured["records"])
+
+
+def test_topbar_and_sidebar_show_active_alert_count(window):
+    with window.services.database.transaction() as connection:
+        for index, status in enumerate(("open", "investigating", "resolved")):
+            event_id = f"event-{index}"
+            connection.execute(
+                "INSERT INTO security_events "
+                "(id, occurred_at, source, event_type, severity, description, observed, "
+                "attributes_json, correlation_id, risk_score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_id,
+                    "2026-10-21T00:00:00+00:00",
+                    "test",
+                    "alert_test",
+                    "high",
+                    "test alert",
+                    1,
+                    "{}",
+                    None,
+                    1.0,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO alerts "
+                "(id, event_id, rule_id, dedupe_key, title, severity, rationale, status, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"alert-{index}",
+                    event_id,
+                    "test-rule",
+                    f"key-{index}",
+                    "Test alert",
+                    "high",
+                    "test",
+                    status,
+                    "2026-10-21T00:00:00+00:00",
+                    "2026-10-21T00:00:00+00:00",
+                ),
+            )
+    window.services.event_pipeline.bus.publish(
+        SecurityEvent(
+            source="test-source",
+            event_type="alert_refresh",
+            severity="low",
+            description="Refresh alert badges",
+        )
+    )
+
+    assert window.topbar.alert_count.text() == "2"
+    assert not window.topbar.alert_count.isHidden()
+    for badge in window.sidebar._alert_badges.values():
+        assert badge.text() == "2"
+        assert not badge.isHidden()
+
+
+def test_lock_warning_cannot_be_cancelled_and_closes_when_identity_is_verified(window):
+    window.show()
+    window.services.identity_service.current_state = "unknown_face"
+    window.services.settings = replace(
+        window.services.settings,
+        automatic_lock_enabled=True,
+    )
+
+    window._warn_before_lock(30)
+    warning = window._lock_warning_box
+    window._warn_before_lock(30)
+
+    assert warning is not None
+    assert window._lock_warning_box is warning
+    assert warning.standardButtons() == QMessageBox.StandardButton.NoButton
+    assert window._lock_timer.isActive()
+    warning.reject()
+    warning.close()
+    assert warning.isVisible()
+
+    window._on_identity_state_changed("recognized", "Enrolled identity recognized.")
+
+    assert window._lock_warning_box is None
+    assert not window._lock_timer.isActive()
+    assert not warning.isVisible()
+
+
 def test_dashboard_monitoring_control_requests_explicit_toggle(qtbot, window):
     dashboard = window._pages["dashboard"]
 

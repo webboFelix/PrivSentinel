@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-qt>=4.4", "ruff>=0.6"]
+voice = ["vosk>=0.3.45", "sounddevice>=0.4.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]

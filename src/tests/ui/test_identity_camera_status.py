@@ -124,11 +124,11 @@ def test_reenrollment_requires_admin_auth_and_retains_history(
 
     dialog = FakeConfirmationDialog()
     monkeypatch.setattr(
-        "src.ui.pages.identity_protection.AdministratorConfirmationDialog",
+        "src.ui.dialogs.administrator_confirmation_dialog.AdministratorConfirmationDialog",
         lambda *args: dialog,
     )
     monkeypatch.setattr(
-        "src.ui.pages.identity_protection.authenticate_windows_administrator",
+        "src.ui.dialogs.administrator_confirmation_dialog.authenticate_windows_administrator",
         lambda username, password: False,
     )
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: None)
@@ -141,7 +141,7 @@ def test_reenrollment_requires_admin_auth_and_retains_history(
     assert dialog.password_cleared
 
     monkeypatch.setattr(
-        "src.ui.pages.identity_protection.authenticate_windows_administrator",
+        "src.ui.dialogs.administrator_confirmation_dialog.authenticate_windows_administrator",
         lambda username, password: True,
     )
     actions = []
@@ -153,6 +153,64 @@ def test_reenrollment_requires_admin_auth_and_retains_history(
     assert services.identity_repository.count_events() == 1
     assert actions == ["identity-enrollment"]
     assert dialog.password_cleared
+    page.deleteLater()
+
+
+def test_stopping_monitoring_requires_administrator_confirmation(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    services.identity_repository.enroll(
+        "Local user",
+        np.arange(1, 33, dtype=np.float32),
+        "test-model",
+        datetime.now(UTC),
+    )
+    services.save_settings(
+        replace(
+            services.settings,
+            camera_access_enabled=True,
+            identity_monitoring_enabled=True,
+            start_monitoring_on_launch=True,
+        )
+    )
+
+    class FakeWorker:
+        running = True
+
+        def isRunning(self):
+            return self.running
+
+        def stop(self):
+            self.running = False
+
+        def wait(self, _timeout=0):
+            return True
+
+        @property
+        def monitoring_seconds(self):
+            return 1.0
+
+    worker = FakeWorker()
+    services.identity_service.worker = worker
+    page = IdentityProtectionPage(services)
+    qtbot.addWidget(page)
+    authorized = False
+    monkeypatch.setattr(
+        "src.ui.pages.identity_protection.confirm_windows_administrator",
+        lambda *args: authorized,
+    )
+
+    page.monitor_button.click()
+    assert services.settings.identity_monitoring_enabled
+    assert worker.isRunning()
+
+    authorized = True
+    page.monitor_button.click()
+    assert not services.settings.identity_monitoring_enabled
+    assert not services.settings.start_monitoring_on_launch
+    assert services.identity_service.worker is None
+
     page.deleteLater()
 
 
@@ -193,6 +251,11 @@ def test_liveness_heuristic_does_not_generate_repeated_system_notifications(
     window._identity_event(event("unknown_face", "Unknown face detected."))
     assert len(notifications) == 1
     assert notifications[0][1] == "Unknown face detected."
+    window._identity_event(event("unknown_face", "Repeated unknown-face sample."))
+    assert len(notifications) == 1
+    window._identity_event(event("recognized", "Enrolled identity recognized."))
+    window._identity_event(event("unknown_face", "New unknown-face incident."))
+    assert len(notifications) == 2
     window.close()
 
 

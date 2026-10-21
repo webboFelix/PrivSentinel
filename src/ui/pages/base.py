@@ -48,6 +48,7 @@ class _ReputationWorker(QThread):
 class DataPage(QWidget):
     actionRequested = Signal(str)
     pageRequested = Signal(str)
+    alertCountChanged = Signal()
 
     page_key = ""
 
@@ -341,6 +342,7 @@ class DataPage(QWidget):
             else "No active rule matches need review"
         )
         self.source_status.set_state("warning" if active else "success")
+        self.alertCountChanged.emit()
 
     def _selected_id(self) -> str | None:
         if self.table is None:

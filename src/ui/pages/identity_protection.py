@@ -6,7 +6,6 @@ from dataclasses import replace
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -17,10 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
-from src.security.windows_auth import authenticate_windows_administrator
 from src.storage.models import IdentityEvent
 from src.ui.dialogs.administrator_confirmation_dialog import (
-    AdministratorConfirmationDialog,
+    confirm_windows_administrator,
 )
 
 
@@ -154,7 +152,7 @@ class IdentityProtectionPage(QWidget):
                 self.identity.current_detail,
             )
         )
-        self._status_timer.start(1000)
+        self._status_timer.start(5000)
 
     def _render_profile(self) -> None:
         profile = self.identity.profile
@@ -176,6 +174,14 @@ class IdentityProtectionPage(QWidget):
 
     def _toggle_monitoring(self) -> None:
         if self.identity.is_monitoring:
+            if not confirm_windows_administrator(
+                self,
+                "Confirm stopping identity monitoring",
+                "Stopping identity monitoring requires credentials for a Windows "
+                "administrator account.",
+                "Verify and stop",
+            ):
+                return
             updated = replace(
                 self.services.settings,
                 identity_monitoring_enabled=False,
@@ -236,39 +242,15 @@ class IdentityProtectionPage(QWidget):
 
     def _remove_identity(self, start_enrollment: bool) -> None:
         action = "re-enroll" if start_enrollment else "delete the enrolled identity"
-        dialog = AdministratorConfirmationDialog(
+        if not confirm_windows_administrator(
+            self,
             f"Confirm {action}",
             "This permanently removes the encrypted face templates and identity "
             "profile details. Verification and enrollment history will be retained. "
             "Camera frames are not stored. Enter credentials for a Windows "
             "administrator account to continue.",
             "Verify and continue",
-            self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            dialog.clear_password()
-            return
-
-        username, password = dialog.credentials()
-        try:
-            authorized = authenticate_windows_administrator(username, password)
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Could not verify administrator credentials",
-                str(exc),
-            )
-            return
-        finally:
-            dialog.clear_password()
-
-        if not authorized:
-            QMessageBox.warning(
-                self,
-                "Administrator verification failed",
-                "The credentials are invalid or the account is not a Windows "
-                "administrator. The identity was not changed.",
-            )
+        ):
             return
 
         try:

@@ -310,6 +310,8 @@ class CameraMonitorWorker(QThread):
         self._last_frame: np.ndarray | None = None
         self._last_face: tuple[int, int, int, int] | None = None
         self._failure_count = 0
+        self._unknown_face_failures = 0
+        self._lock_warning_issued = False
         self._monitor_started = time.monotonic()
         self._camera_error_reported = False
         self._policy = VerificationPolicy()
@@ -427,7 +429,7 @@ class CameraMonitorWorker(QThread):
                             state, detail, confidence, liveness_result
                         )
                     if state == "recognized":
-                        self._failure_count = 0
+                        self._clear_lock_warning_after_verification()
                     elif state in {
                         "unknown_face",
                         "low_confidence",
@@ -436,6 +438,10 @@ class CameraMonitorWorker(QThread):
                         "no_face_detected",
                     }:
                         self._failure_count += 1
+                    if state == "unknown_face":
+                        self._unknown_face_failures += 1
+                    else:
+                        self._unknown_face_failures = 0
                     action = (
                         self.settings.presence_loss_action
                         if state == "no_face_detected"
@@ -443,14 +449,13 @@ class CameraMonitorWorker(QThread):
                     )
                     decision = self._policy.decide(
                         state,
-                        self._failure_count,
+                        self._unknown_face_failures,
                         self.settings.identity_failure_limit,
                         self.settings.automatic_lock_enabled,
                         action,
                     )
                     if decision.action == "warn_then_lock":
-                        self.lockRequested.emit()
-                        self._failure_count = 0
+                        self._request_lock_warning_once()
                     elapsed = time.monotonic() - cycle_start
                     self._stop_event.wait(
                         max(0.0, self.settings.capture_interval_ms / 1000 - elapsed)
@@ -508,3 +513,14 @@ class CameraMonitorWorker(QThread):
             self._last_event_state = state
             self._last_event_time = now
         self.stateChanged.emit(state, detail)
+
+    def _request_lock_warning_once(self) -> None:
+        if self._lock_warning_issued:
+            return
+        self._lock_warning_issued = True
+        self.lockRequested.emit()
+
+    def _clear_lock_warning_after_verification(self) -> None:
+        self._failure_count = 0
+        self._unknown_face_failures = 0
+        self._lock_warning_issued = False

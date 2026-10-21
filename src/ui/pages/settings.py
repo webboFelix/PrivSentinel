@@ -25,6 +25,9 @@ from PySide6.QtWidgets import (
 from src.app.dependencies import ApplicationServices
 from src.config.settings import AppSettings
 from src.ui.components.status_indicator import StatusIndicator
+from src.ui.dialogs.administrator_confirmation_dialog import (
+    confirm_windows_administrator,
+)
 from src.ui.dialogs.confirmation_dialog import ConfirmationDialog
 from src.ui.icon_assets import icon_path
 
@@ -195,9 +198,11 @@ class SettingsPage(QWidget):
         )
         identity_form.addRow("Repeated unknown-face response", self.unknown_face_action)
         self.presence_loss_action = QComboBox()
-        self.presence_loss_action.addItem("Notify only (default)", "notify_only")
         self.presence_loss_action.addItem(
-            "Warn, then lock after grace period", "lock_after_grace"
+            "Notify only (presence loss never locks)", "notify_only"
+        )
+        self.presence_loss_action.addItem(
+            "Legacy setting (presence loss never locks)", "lock_after_grace"
         )
         self.presence_loss_action.setCurrentIndex(
             self.presence_loss_action.findData(
@@ -210,7 +215,7 @@ class SettingsPage(QWidget):
         self.failure_limit.setValue(services.settings.identity_failure_limit)
         identity_form.addRow("Consecutive failure limit", self.failure_limit)
         self.automatic_lock = QCheckBox(
-            "Opt in to automatic workstation lock after warning"
+            "Opt in to automatic workstation lock after an unknown-face warning"
         )
         self.automatic_lock.setChecked(
             services.settings.automatic_lock_enabled
@@ -456,28 +461,32 @@ class SettingsPage(QWidget):
             or not self.services.endpoint_service.has_file_baseline(roots, exclusions)
         )
         if self.automatic_lock.isChecked():
-            if (
-                self.unknown_face_action.currentData() != "lock_after_grace"
-                and self.presence_loss_action.currentData() != "lock_after_grace"
-            ):
+            if self.unknown_face_action.currentData() != "lock_after_grace":
                 QMessageBox.warning(
                     self,
                     "Choose a locking response",
-                    "Select a lock-after-grace response before opting into automatic "
-                    "workstation locking.",
+                    "Select the unknown-face lock-after-grace response before "
+                    "opting into automatic workstation locking. Absence and camera "
+                    "failure never trigger a lock.",
                 )
                 return
             confirmation = QMessageBox.warning(
                 self,
                 "Confirm automatic workstation locking",
-                "After repeated identity failures, the workstation will lock following "
-                f"a {self.lock_grace.value()}-second warning. Camera failures will not "
-                "cause a lock. Enable this behavior?",
+                "When an unknown face reaches the configured failure threshold, the "
+                f"workstation will lock after a {self.lock_grace.value()}-second "
+                "warning. Verification of the enrolled identity dismisses the "
+                "warning; no-face and camera failures never cause a lock. Enable "
+                "this behavior?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if confirmation != QMessageBox.StandardButton.Yes:
                 return
+        if not self.identity_monitoring.isChecked() and not self._confirm_monitoring_admin(
+            "disable continuous identity monitoring"
+        ):
+            return
         settings = replace(
             self.services.settings,
             log_level=self.log_level_combo.currentText(),
@@ -537,6 +546,13 @@ class SettingsPage(QWidget):
             self, "Reset settings", "Restore all application settings to safe defaults?"
         ):
             return
+        if (
+            self.services.settings.identity_monitoring_enabled
+            or self.services.identity_service.is_monitoring
+        ) and not self._confirm_monitoring_admin(
+            "reset settings and stop identity monitoring"
+        ):
+            return
         try:
             settings = self.services.reset_settings()
         except (OSError, ValueError) as exc:
@@ -580,6 +596,13 @@ class SettingsPage(QWidget):
             "Replace the current settings with the selected backup?",
         ):
             return
+        if (
+            self.services.settings.identity_monitoring_enabled
+            or self.services.identity_service.is_monitoring
+        ) and not self._confirm_monitoring_admin(
+            "restore settings that may stop identity monitoring"
+        ):
+            return
         try:
             settings = self.services.restore_settings(source)
         except (OSError, ValueError) as exc:
@@ -587,6 +610,20 @@ class SettingsPage(QWidget):
             return
         self._show_settings(settings)
         self.status.set_text("Backup restored and applied")
+
+    def _confirm_monitoring_admin(self, action: str) -> bool:
+        if not (
+            self.services.settings.identity_monitoring_enabled
+            or self.services.identity_service.is_monitoring
+        ):
+            return True
+        return confirm_windows_administrator(
+            self,
+            f"Confirm {action}",
+            f"This change may stop or disable identity monitoring. {action.capitalize()} "
+            "requires credentials for a Windows administrator account.",
+            "Verify and continue",
+        )
 
     def _show_settings(self, settings: AppSettings) -> None:
         self.log_level_combo.setCurrentText(settings.log_level)

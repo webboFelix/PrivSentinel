@@ -50,6 +50,7 @@ class Sidebar(QFrame):
         self.setMaximumWidth(224)
         self.setFixedWidth(214)
         self._buttons: dict[str, QPushButton] = {}
+        self._alert_badges: dict[str, QLabel] = {}
         self._previous_category = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -126,6 +127,11 @@ class Sidebar(QFrame):
         icon_name = "shield-check.png" if active else "info-alert.png"
         self._status_icon.setPixmap(QIcon(icon_path(icon_name)).pixmap(19, 19))
 
+    def set_alert_count(self, count: int) -> None:
+        for badge in self._alert_badges.values():
+            badge.setText(str(count) if count < 100 else "99+")
+            badge.setVisible(count > 0)
+
     def _add_page_button(self, layout: QVBoxLayout, definition: PageDefinition) -> None:
         button = QPushButton(definition.title)
         button.setIcon(QIcon(icon_path(self._ICONS[definition.key])))
@@ -135,7 +141,24 @@ class Sidebar(QFrame):
         button.setProperty("pageKey", definition.key)
         page_key = definition.key
         button.clicked.connect(lambda: self.pageSelected.emit(page_key))
-        layout.addWidget(button)
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        row_layout.addWidget(button, 1)
+        if definition.key in {"alerts", "threat-detection"}:
+            badge = QLabel("0")
+            badge.setObjectName("sidebarAlertCount")
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setMinimumWidth(18)
+            badge.setStyleSheet(
+                "color: white; background: #b4233b; border-radius: 9px; "
+                "font-size: 8pt; font-weight: 700; padding: 1px 5px;"
+            )
+            badge.hide()
+            row_layout.addWidget(badge)
+            self._alert_badges[definition.key] = badge
+        layout.addWidget(row)
         self._buttons[definition.key] = button
 
     def set_active_page(self, key: str) -> None:

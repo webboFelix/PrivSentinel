@@ -26,28 +26,12 @@ class VerificationPolicy:
                 False,
             )
         if state == "no_face_detected":
-            action = "warn_then_lock" if unknown_face_action == "lock_after_grace" else "notify"
-            if (
-                consecutive_failures >= failure_limit
-                and automatic_lock_enabled
-                and action == "warn_then_lock"
-            ):
-                return PolicyDecision(
-                    action,
-                    "Configured presence-loss threshold reached; grace-period warning required.",
-                    True,
-                )
             return PolicyDecision(
                 "notify",
                 "No face is currently present; this is not proof of an attack.",
                 False,
             )
-        if state not in {
-            "unknown_face",
-            "low_confidence",
-            "liveness_failure",
-            "multiple_faces",
-        }:
+        if state != "unknown_face":
             return PolicyDecision("none", "No response is required.", False)
         if consecutive_failures < failure_limit:
             return PolicyDecision(

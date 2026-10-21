@@ -6,10 +6,20 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QProcess, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QProcess,
+    QSettings,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLayout,
     QMainWindow,
@@ -27,6 +37,10 @@ from src.identity.face_verifier import recognition_model_is_installed
 from src.response.network_actions import block_ip
 from src.ui.components.sidebar import Sidebar
 from src.ui.components.topbar import TopBar
+from src.ui.components.voice_search_worker import VoiceSearchWorker
+from src.ui.dialogs.administrator_confirmation_dialog import (
+    confirm_windows_administrator,
+)
 from src.ui.dialogs.enrollment_dialog import EnrollmentDialog
 from src.ui.dialogs.notice_dialog import NoticeDialog
 from src.ui.dialogs.search_results_dialog import SearchResultsDialog
@@ -44,8 +58,29 @@ class _PageStack(QStackedWidget):
         return page.minimumSizeHint() if page is not None else super().minimumSizeHint()
 
 
+class _LockWarningBox(QMessageBox):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._allow_close = False
+
+    def accept(self) -> None:
+        self._allow_close = True
+        super().accept()
+
+    def reject(self) -> None:
+        if self._allow_close:
+            super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._allow_close:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
 class MainWindow(QMainWindow):
     recognitionModelPreparationFinished = Signal(bool, str)
+    securityEventPublished = Signal()
 
     def __init__(
         self,
@@ -80,6 +115,7 @@ class MainWindow(QMainWindow):
         self.services = services or ApplicationServices.create()
         self._model_preparation_process: QProcess | None = None
         self._model_preparation_output = bytearray()
+        self._voice_search_worker: VoiceSearchWorker | None = None
 
         self._pages: dict[str, QWidget] = {}
 
@@ -157,6 +193,9 @@ class MainWindow(QMainWindow):
                 page = PAGE_WIDGETS[definition.key]()
 
             page.actionRequested.connect(self._handle_page_action)
+            alert_count_signal = getattr(page, "alertCountChanged", None)
+            if alert_count_signal is not None:
+                alert_count_signal.connect(self._update_alert_count)
 
             if hasattr(page, "pageRequested"):
                 page.pageRequested.connect(self.navigate_to)
@@ -189,6 +228,8 @@ class MainWindow(QMainWindow):
 
         self.topbar.globalSearchRequested.connect(self._search_pages)
 
+        self.topbar.voiceSearchRequested.connect(self._toggle_voice_search)
+
         self.topbar.notificationsRequested.connect(lambda: self.navigate_to("alerts"))
 
         self.services.identity_service.lockWarningRequested.connect(self._warn_before_lock)
@@ -200,7 +241,7 @@ class MainWindow(QMainWindow):
         self.services.identity_service.eventRecorded.connect(self._identity_event)
 
         self.services.identity_service.stateChanged.connect(
-            self._update_dashboard_identity
+            self._on_identity_state_changed
         )
 
         self.services.identity_service.profileChanged.connect(self._update_dashboard_identity)
@@ -211,6 +252,10 @@ class MainWindow(QMainWindow):
         self.services.identity_service.cameraStateChanged.connect(
             self._on_camera_state_changed
         )
+        self.securityEventPublished.connect(self._update_alert_count)
+        self._unsubscribe_security_events = self.services.event_pipeline.bus.subscribe(
+            lambda _event: self.securityEventPublished.emit()
+        )
 
         self._lock_timer = QTimer(self)
 
@@ -219,6 +264,7 @@ class MainWindow(QMainWindow):
         self._lock_timer.timeout.connect(self._complete_lock_warning)
 
         self._lock_warning_box: QMessageBox | None = None
+        self._identity_warning_active = False
 
         # Native Windows system-tray integration.
         self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
@@ -255,7 +301,7 @@ class MainWindow(QMainWindow):
 
         self._status_timer.timeout.connect(self._update_dashboard_identity)
 
-        self._status_timer.start(1000)
+        self._status_timer.start(5000)
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._stop_background_activity)
@@ -265,6 +311,7 @@ class MainWindow(QMainWindow):
         self._search_shortcut.activated.connect(self._focus_search)
 
         self._update_dashboard_identity()
+        self._update_alert_count()
 
         self._restore_preferences()
 
@@ -366,12 +413,9 @@ class MainWindow(QMainWindow):
         self.topbar.search_bar.selectAll()
 
     def _search_pages(self, query: str) -> None:
-
         normalized = query.casefold().strip()
-
         if not normalized:
             self._focus_search()
-
             return
 
         matches = [
@@ -382,10 +426,106 @@ class MainWindow(QMainWindow):
             or normalized in page.category.casefold()
         ]
 
-        dialog = SearchResultsDialog(query, matches, self)
+        records: list[tuple[str, str]] = []
+        try:
+            for alert in self.services.security_repository.list_alerts(limit=10000):
+                searchable = " ".join(
+                    str(alert[key])
+                    for key in (
+                        "title",
+                        "severity",
+                        "source",
+                        "event_type",
+                        "description",
+                        "status",
+                    )
+                )
+                if normalized in searchable.casefold():
+                    records.append(
+                        (
+                            f"ALERT · {alert['title']} · {alert['severity']} · {alert['status']}",
+                            "alerts",
+                        )
+                    )
+                    if len(records) >= 100:
+                        break
+
+            if len(records) < 100:
+                for event in self.services.security_repository.list_events(
+                    limit=2000,
+                    query=query,
+                ):
+                    records.append(
+                        (
+                            (
+                                f"EVENT · {event['source']} · {event['event_type']} · "
+                                f"{event['description']}"
+                            ),
+                            "audit-log",
+                        )
+                    )
+                    if len(records) >= 100:
+                        break
+
+            if len(records) < 100:
+                token = f"%{query.strip()}%"
+                file_rows = self.services.database.fetchall(
+                    "SELECT path FROM file_integrity_baselines "
+                    "WHERE path LIKE ? ORDER BY path LIMIT ?",
+                    (token, 100 - len(records)),
+                )
+                records.extend(
+                    (f"FILE · {row['path']}", "file-integrity")
+                    for row in file_rows
+                )
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            self.statusBar().showMessage(f"Global search failed: {exc}", 10000)
+            return
+
+        dialog = SearchResultsDialog(query, matches, self, records)
 
         if dialog.exec() == SearchResultsDialog.DialogCode.Accepted and dialog.selected_key:
             self.navigate_to(dialog.selected_key)
+
+    def _toggle_voice_search(self) -> None:
+        worker = self._voice_search_worker
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            self.topbar.set_voice_search_active(False)
+            return
+
+        settings = QSettings("PrivSentinel", "PrivSentinel")
+        model_directory = str(settings.value("voiceSearch/modelDirectory", ""))
+        if not model_directory or not Path(model_directory).is_dir():
+            model_directory = QFileDialog.getExistingDirectory(
+                self,
+                "Select offline Vosk speech model",
+                str(self.services.paths.models_directory),
+            )
+            if not model_directory:
+                return
+            settings.setValue("voiceSearch/modelDirectory", model_directory)
+
+        worker = VoiceSearchWorker(model_directory, self)
+        self._voice_search_worker = worker
+        worker.recognized.connect(self._on_voice_search_recognized)
+        worker.failed.connect(
+            lambda message: self.statusBar().showMessage(message, 12000)
+        )
+        worker.finished.connect(
+            lambda worker=worker: self._voice_search_finished(worker)
+        )
+        self.topbar.set_voice_search_active(True)
+        worker.start()
+
+    def _on_voice_search_recognized(self, phrase: str) -> None:
+        self.topbar.search_bar.setText(phrase)
+        self._search_pages(phrase)
+
+    def _voice_search_finished(self, worker: VoiceSearchWorker) -> None:
+        if self._voice_search_worker is worker:
+            self._voice_search_worker = None
+            self.topbar.set_voice_search_active(False)
 
     def _handle_page_action(self, action: str) -> None:
 
@@ -449,8 +589,31 @@ class MainWindow(QMainWindow):
         if action == "toggle-monitoring":
             identity = self.services.identity_service
             if identity.is_monitoring:
-                identity.stop_monitoring()
-                self.statusBar().showMessage("Identity monitoring paused", 5000)
+                if not confirm_windows_administrator(
+                    self,
+                    "Confirm stopping identity monitoring",
+                    "Stopping identity monitoring requires credentials for a "
+                    "Windows administrator account.",
+                    "Verify and stop",
+                ):
+                    return
+                try:
+                    self.services.save_settings(
+                        replace(
+                            self.services.settings,
+                            identity_monitoring_enabled=False,
+                            start_monitoring_on_launch=False,
+                        )
+                    )
+                    identity.stop_monitoring()
+                except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    QMessageBox.critical(
+                        self,
+                        "Could not stop monitoring",
+                        str(exc),
+                    )
+                    return
+                self.statusBar().showMessage("Identity monitoring stopped", 5000)
                 return
             if not self.services.settings.camera_access_enabled:
                 answer = QMessageBox.question(
@@ -684,49 +847,41 @@ class MainWindow(QMainWindow):
         self.recognitionModelPreparationFinished.emit(False, message)
 
     def _warn_before_lock(self, grace_seconds: int) -> None:
-
-        if not self.services.settings.automatic_lock_enabled:
+        if (
+            not self.services.settings.automatic_lock_enabled
+            or self.services.identity_service.current_state != "unknown_face"
+            or self._lock_warning_box is not None
+        ):
             return
 
-        box = QMessageBox(self)
-
+        box = _LockWarningBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-
         box.setWindowTitle("Identity security warning")
-
         box.setText(
-            "The configured identity response policy was triggered. "
-            f"The workstation will lock in {grace_seconds} seconds unless cancelled."
+            "An unknown face was detected. "
+            f"The workstation will lock in {grace_seconds} seconds."
         )
-
         box.setInformativeText(
             "This is a basic face-motion check, not robust anti-spoofing. "
             "Camera failure never triggers this response."
         )
-
-        box.setStandardButtons(QMessageBox.StandardButton.Cancel)
-
-        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
-
-        box.button(QMessageBox.StandardButton.Cancel).setText("Cancel lock")
-
-        box.finished.connect(lambda _result: self._lock_timer.stop())
-
+        box.setStandardButtons(QMessageBox.StandardButton.NoButton)
+        box.setEscapeButton(QMessageBox.StandardButton.NoButton)
+        box.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self._lock_warning_box = box
-
         box.show()
-
         self._lock_timer.start(grace_seconds * 1000)
 
     def _complete_lock_warning(self) -> None:
-
-        if not self.services.settings.automatic_lock_enabled:
+        if (
+            not self.services.settings.automatic_lock_enabled
+            or self.services.identity_service.current_state
+            in {"recognized", "stopped"}
+        ):
+            self._dismiss_lock_warning()
             return
 
-        if self._lock_warning_box is not None:
-            self._lock_warning_box.accept()
-
-            self._lock_warning_box = None
+        self._dismiss_lock_warning()
 
         try:
             import ctypes
@@ -737,24 +892,56 @@ class MainWindow(QMainWindow):
         except (AttributeError, OSError) as exc:
             self.services.identity_service.serviceError.emit(f"Could not lock workstation: {exc}")
 
-    def _identity_event(self, event) -> None:
+    def _dismiss_lock_warning(self) -> None:
+        self._lock_timer.stop()
+        box = self._lock_warning_box
+        self._lock_warning_box = None
+        if box is not None:
+            box.accept()
 
+    def _on_identity_state_changed(self, state: str, _detail: str) -> None:
+        if state in {"recognized", "stopped"}:
+            self._identity_warning_active = False
+            self._dismiss_lock_warning()
         self._update_dashboard_identity()
 
+    def _identity_event(self, event) -> None:
+        self._update_dashboard_identity()
+
+        if event.state == "recognized":
+            self._identity_warning_active = False
+            return
         if not self.services.settings.identity_notifications_enabled:
             return
-
         if event.state in {
             "unknown_face",
             "multiple_faces",
             "camera_unavailable",
         }:
+            if self._identity_warning_active:
+                return
+            self._identity_warning_active = True
             self._identity_tray.showMessage(
                 "PrivSentinel identity protection",
                 event.detail,
                 QSystemTrayIcon.MessageIcon.Warning,
                 7000,
             )
+
+    def _update_alert_count(self) -> None:
+        if self._closing:
+            return
+        try:
+            alerts = self.services.security_repository.list_alerts(limit=10000)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            self.statusBar().showMessage(f"Could not read alert count: {exc}", 10000)
+            return
+        count = sum(
+            alert["status"] in {"open", "acknowledged", "investigating"}
+            for alert in alerts
+        )
+        self.topbar.set_alert_count(count)
+        self.sidebar.set_alert_count(count)
 
     def _update_dashboard_identity(self) -> None:
         if self._closing:
@@ -806,8 +993,13 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._unsubscribe_security_events()
         self._status_timer.stop()
         self._lock_timer.stop()
+        voice_worker = self._voice_search_worker
+        if voice_worker is not None and voice_worker.isRunning():
+            voice_worker.stop()
+            voice_worker.wait(1500)
         for timer in self.findChildren(QTimer):
             timer.stop()
         integrity_page = self._pages.get("file-integrity")
