@@ -11,6 +11,23 @@ class ConnectionMonitor:
     def __init__(self) -> None:
         self._seen: set[tuple[object, ...]] = set()
 
+    @staticmethod
+    def inventory_counts() -> tuple[int, int]:
+        """Return remote socket count and the number attributed to a process."""
+        try:
+            connections = psutil.net_connections(kind="inet")
+        except (psutil.AccessDenied, OSError) as exc:
+            raise PermissionError(
+                f"Network connection metadata is unavailable: {exc}"
+            ) from exc
+        remote_connections = [
+            connection for connection in connections if connection.raddr
+        ]
+        attributed = sum(
+            connection.pid is not None for connection in remote_connections
+        )
+        return len(remote_connections), attributed
+
     def collect(self) -> list[SecurityEvent]:
         try:
             connections = psutil.net_connections(kind="inet")

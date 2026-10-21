@@ -29,6 +29,7 @@ class MonitoringWorker(QThread):
         self.collector = collector
         self.interval_seconds = interval_seconds
         self._stop_event = threading.Event()
+        self.last_successful_collection_at: float | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -45,8 +46,9 @@ class MonitoringWorker(QThread):
                         raise TypeError(
                             f"{self.source_name} collector returned a non-event value."
                         )
+                self.last_successful_collection_at = time.monotonic()
                 self.stateChanged.emit("running")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - report collector failures to the UI
                 self.errorRaised.emit(f"{self.source_name}: {exc}")
                 self.stateChanged.emit("error")
             elapsed = time.monotonic() - started

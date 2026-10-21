@@ -19,7 +19,7 @@ class MetricCard(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("metricCard")
-        self.setMinimumHeight(102)
+        self.setMinimumHeight(88)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(13, 10, 13, 10)
         layout.setSpacing(4)

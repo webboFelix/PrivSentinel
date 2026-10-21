@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import io
+import json
 import uuid
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -15,6 +16,13 @@ from src.storage.models import IdentityEvent, IdentityProfile
 
 class IdentityRepository:
     _SECRET_NAME = "face-template"
+    _PROFILE_SECRET_NAME = "identity-profile"
+    _PROFILE_FIELDS = frozenset({
+        "email",
+        "department",
+        "employee_id",
+        "machine_user",
+    })
 
     def __init__(self, database: SQLiteDatabase, secrets: WindowsSecretStore) -> None:
         self.database = database
@@ -27,12 +35,14 @@ class IdentityRepository:
         )
         if row is None:
             return None
+        details = self._profile_details()
         return IdentityProfile(
             display_name=row["display_name"],
             enrolled_at=datetime.fromisoformat(row["enrolled_at"]),
             model_name=row["model_name"],
             template_dimensions=row["template_dimensions"],
             consent_recorded_at=datetime.fromisoformat(row["consent_recorded_at"]),
+            **details,
         )
 
     def template(self) -> np.ndarray | None:
@@ -53,9 +63,11 @@ class IdentityRepository:
         embedding: np.ndarray,
         model_name: str,
         consent_recorded_at: datetime,
+        profile_details: dict[str, str] | None = None,
     ) -> IdentityProfile:
         name = display_name.strip()
         vector = np.asarray(embedding, dtype=np.float32)
+        details = self._validate_profile_details(profile_details or {})
         if not name or len(name) > 120:
             raise ValueError("Display name must contain between 1 and 120 characters.")
         if (
@@ -71,8 +83,16 @@ class IdentityRepository:
         stream = io.BytesIO()
         np.save(stream, vector / np.linalg.norm(vector), allow_pickle=False)
         previous_template = self.secrets.get(self._SECRET_NAME)
-        self.secrets.set(self._SECRET_NAME, stream.getvalue())
+        previous_details = self.secrets.get(self._PROFILE_SECRET_NAME)
         try:
+            self.secrets.set(self._SECRET_NAME, stream.getvalue())
+            if any(details.values()):
+                self.secrets.set(
+                    self._PROFILE_SECRET_NAME,
+                    json.dumps(details, sort_keys=True).encode("utf-8"),
+                )
+            else:
+                self.secrets.delete(self._PROFILE_SECRET_NAME)
             with self.database.transaction() as connection:
                 connection.execute(
                     """
@@ -95,20 +115,81 @@ class IdentityRepository:
                         consent_recorded_at.astimezone(timezone.utc).isoformat(),
                     ),
                 )
-        except BaseException:
-            if previous_template is None:
-                self.secrets.delete(self._SECRET_NAME)
-            else:
-                self.secrets.set(self._SECRET_NAME, previous_template)
+        except BaseException as exc:
+            try:
+                self._restore_secret(self._SECRET_NAME, previous_template)
+                self._restore_secret(self._PROFILE_SECRET_NAME, previous_details)
+            except (OSError, RuntimeError, ValueError) as rollback_exc:
+                raise RuntimeError(
+                    f"Enrollment failed and its protected data could not be fully restored: {rollback_exc}"
+                ) from exc
             raise
-        return IdentityProfile(name, now, model_name, int(vector.size), consent_recorded_at)
+        return IdentityProfile(
+            name,
+            now,
+            model_name,
+            int(vector.size),
+            consent_recorded_at,
+            **details,
+        )
 
     def delete_profile(self) -> bool:
         had_profile = self.profile() is not None
         with self.database.transaction() as connection:
             connection.execute("DELETE FROM identity_profile WHERE id = 1")
         self.secrets.delete(self._SECRET_NAME)
+        self.secrets.delete(self._PROFILE_SECRET_NAME)
         return had_profile
+
+    def _profile_details(self) -> dict[str, str]:
+        protected = self.secrets.get(self._PROFILE_SECRET_NAME)
+        if protected is None:
+            return {}
+        try:
+            details = json.loads(protected.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Stored identity profile details are unreadable.") from exc
+        if not isinstance(details, dict):
+            raise TypeError("Stored identity profile details failed validation.")
+        normalized = self._validate_profile_details(details)
+        return {key: value for key, value in normalized.items() if value}
+
+    @classmethod
+    def _validate_profile_details(
+        cls, details: dict[str, str]
+    ) -> dict[str, str]:
+        if set(details) - cls._PROFILE_FIELDS:
+            raise ValueError("Identity profile contains unsupported fields.")
+        normalized = {
+            key: value.strip()
+            for key, value in details.items()
+            if isinstance(value, str)
+        }
+        if len(normalized) != len(details):
+            raise ValueError("Identity profile fields must be text.")
+        limits = {
+            "email": 254,
+            "department": 120,
+            "employee_id": 64,
+            "machine_user": 120,
+        }
+        for key, value in normalized.items():
+            if len(value) > limits[key] or any(ord(character) < 32 for character in value):
+                raise ValueError(f"Identity {key.replace('_', ' ')} is invalid.")
+        email = normalized.get("email", "")
+        if email and (
+            email.count("@") != 1
+            or any(character.isspace() for character in email)
+            or "." not in email.rsplit("@", 1)[1]
+        ):
+            raise ValueError("Enter a valid email address.")
+        return {key: normalized.get(key, "") for key in cls._PROFILE_FIELDS}
+
+    def _restore_secret(self, name: str, value: bytes | None) -> None:
+        if value is None:
+            self.secrets.delete(name)
+        else:
+            self.secrets.set(name, value)
 
     def record_event(
         self,

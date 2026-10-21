@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,7 @@ from src.config.defaults import (
     DEFAULT_WINDOWS_LOG_COLLECTION_ENABLED,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _UNKNOWN_FACE_ACTIONS = frozenset({"notify_only", "lock_after_grace"})
 
@@ -84,6 +84,8 @@ class AppSettings:
     identity_monitoring_enabled: bool = DEFAULT_IDENTITY_MONITORING_ENABLED
     start_monitoring_on_launch: bool = DEFAULT_START_MONITORING_ON_LAUNCH
     identity_notifications_enabled: bool = DEFAULT_IDENTITY_NOTIFICATIONS_ENABLED
+    recognition_model_download_prompted: bool = False
+    recognition_model_download_allowed: bool = False
     endpoint_poll_interval_seconds: int = DEFAULT_ENDPOINT_POLL_INTERVAL_SECONDS
     process_monitoring_enabled: bool = DEFAULT_PROCESS_MONITORING_ENABLED
     network_monitoring_enabled: bool = DEFAULT_NETWORK_MONITORING_ENABLED
@@ -93,6 +95,8 @@ class AppSettings:
     process_exclusions: tuple[str, ...] = ()
     file_integrity_roots: tuple[str, ...] = ()
     file_integrity_exclusions: tuple[str, ...] = ()
+    download_scan_directory: str | None = None
+    download_scan_enabled: bool = False
 
     def validated(self) -> AppSettings:
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
@@ -115,6 +119,7 @@ class AppSettings:
             "network_monitoring_enabled",
             "file_integrity_monitoring_enabled",
             "windows_log_collection_enabled",
+            "download_scan_enabled",
         ):
             if type(getattr(self, name)) is not bool:
                 raise SettingsError(f"{name} must be a boolean.")
@@ -163,6 +168,8 @@ class AppSettings:
             "identity_monitoring_enabled",
             "start_monitoring_on_launch",
             "identity_notifications_enabled",
+            "recognition_model_download_prompted",
+            "recognition_model_download_allowed",
         ):
             if type(getattr(self, name)) is not bool:
                 raise SettingsError(f"{name} must be a boolean.")
@@ -213,6 +220,18 @@ class AppSettings:
                     base64.b64decode(value, validate=True)
                 except (ValueError, base64.binascii.Error) as exc:
                     raise SettingsError(f"{name} must contain valid base64 data.") from exc
+        if self.download_scan_directory is not None and (
+            not isinstance(self.download_scan_directory, str)
+            or not self.download_scan_directory.strip()
+            or len(self.download_scan_directory) > 2048
+        ):
+            raise SettingsError(
+                "download_scan_directory must be a non-empty path or null."
+            )
+        if self.download_scan_enabled and self.download_scan_directory is None:
+            raise SettingsError(
+                "A download_scan_directory is required when download scanning is enabled."
+            )
         return self
 
 
@@ -235,7 +254,6 @@ class SettingsStore:
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise SettingsError(f"Could not read settings file {self.path}: {exc}") from exc
             migrated = self._migrate(raw)
-            migrated["camera_index"] = DEFAULT_CAMERA_INDEX
             settings = self._from_mapping(migrated)
             if migrated != raw:
                 self._write(settings)
@@ -243,7 +261,6 @@ class SettingsStore:
 
     def save(self, settings: AppSettings) -> AppSettings:
         with self._lock:
-            settings = replace(settings, camera_index=DEFAULT_CAMERA_INDEX)
             settings.validated()
             if self.path.exists() and settings.backup_before_save:
                 self.backup()
@@ -291,12 +308,13 @@ class SettingsStore:
             migrated.setdefault("backup_before_save", False)
             migrated.setdefault("window_geometry", None)
             migrated.setdefault("window_state", None)
+            migrated.setdefault("camera_index", 0)
             migrated["schema_version"] = 2
             version = 2
         if version == 2:
             migrated.update(
                 {
-                    "camera_index": DEFAULT_CAMERA_INDEX,
+                    "camera_index": 0,
                     "camera_width": DEFAULT_CAMERA_WIDTH,
                     "camera_height": DEFAULT_CAMERA_HEIGHT,
                     "capture_interval_ms": DEFAULT_CAPTURE_INTERVAL_MS,
@@ -336,7 +354,24 @@ class SettingsStore:
                     "schema_version": 4,
                 }
             )
-        migrated["camera_index"] = DEFAULT_CAMERA_INDEX
+            version = 4
+        if version == 4:
+            migrated.update(
+                {
+                    "recognition_model_download_prompted": False,
+                    "recognition_model_download_allowed": False,
+                    "schema_version": 5,
+                }
+            )
+            version = 5
+        if version == 5:
+            migrated.update(
+                {
+                    "download_scan_directory": None,
+                    "download_scan_enabled": False,
+                    "schema_version": 6,
+                }
+            )
         return migrated
 
     @staticmethod

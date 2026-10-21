@@ -62,6 +62,10 @@ class AppPaths:
     def quarantine_directory(self) -> Path:
         return self.root / "quarantine"
 
+    @property
+    def yara_rules_directory(self) -> Path:
+        return self.root / "rules"
+
     def ensure_directories(self) -> None:
         for directory in (
             self.root,
@@ -73,5 +77,6 @@ class AppPaths:
             self.models_directory,
             self.exports_directory,
             self.quarantine_directory,
+            self.yara_rules_directory,
         ):
             directory.mkdir(parents=True, exist_ok=True)

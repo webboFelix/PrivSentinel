@@ -26,13 +26,9 @@ PyOpenGL>=3.1.7
 # CAMERA AND IMAGE PROCESSING
 # -----------------------------
 
-opencv-python>=4.11,<5
-# Captures webcam frames, processes images, draws face boxes,
-# converts image formats, and supports real-time camera preview. The local face
-# detector requires the Haar cascade asset packaged in this supported release line.
 opencv-contrib-python>=4.11,<5
-# MediaPipe installs this second OpenCV distribution; keep both below 5 so they
-# install compatible cv2 files and cascade assets.
+# Captures webcam frames, processes images, and includes the Haar cascades used
+# for local face guidance. MediaPipe uses the same cv2 module.
 
 numpy
 # Performs numerical operations on camera frames and face embeddings.
@@ -54,8 +50,9 @@ mediapipe
 # face direction, and basic face-mesh analysis.
 
 insightface
-# Generates face embeddings and supports face detection,
-# alignment, and identity verification for enrolled users.
+# Generates local face embeddings and aligns detected faces.
+scikit-image>=0.22,<0.26
+# InsightFace calls SimilarityTransform.estimate, deprecated in scikit-image 0.26.
 
 onnxruntime
 # CPU inference engine used to run InsightFace models locally.
@@ -208,8 +205,9 @@ psutil
 # Helps review running processes, process paths, CPU use, and parent-child process context.
 
 requests
-# Optional.
-# Use only for explicit, hash-only threat-intelligence/VirusTotal lookups.
+# Optional HTTP client for external threat-intelligence lookups.
+# PrivSentinel sends only user-selected IP, domain, or SHA-256 indicators to VirusTotal;
+# browser URLs are checked against the locally synchronized URLhaus feed.
 
 rich
 # Optional for development/debugging console output.
@@ -217,3 +215,4 @@ rich
 
 PyOpenGL 
 PyOpenGL_accelerate
+yara-python

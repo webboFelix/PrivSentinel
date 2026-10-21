@@ -20,7 +20,7 @@ QLabel#muted, QLabel#subtitle, QLabel#caption { color: #8ea9c8; }
 QLabel#pageTitle { font-size: 20pt; font-weight: 650; }
 QLabel#sectionTitle { font-size: 10pt; font-weight: 600; }
 QLabel#caption { font-size: 8pt; font-weight: 600; }
-QLabel#chartPeriod {
+QComboBox#chartPeriod {
     color: #8ea9c8;
     background: #0a2b4d;
     border: 1px solid #16466f;
@@ -33,6 +33,21 @@ QLabel#chartLegend {
     font-size: 8pt;
     padding: 0 4px 2px 4px;
 }
+QFrame#threatDetails {
+    background: #071a31;
+    border: 1px solid #16466f;
+    border-radius: 7px;
+}
+QLabel#threatTitle { color: #edf6ff; font-weight: 600; }
+QLabel#threatSeverity {
+    color: #b7d9ef;
+    background: #103456;
+    border: 1px solid #1b5681;
+    border-radius: 8px;
+    padding: 2px 6px;
+    font-size: 7pt;
+    font-weight: 650;
+}
 QPushButton {
     background: #092748;
     border: 1px solid #16466f;
@@ -42,6 +57,10 @@ QPushButton {
 QPushButton:hover { background: #12375e; border-color: #00b9e8; }
 QPushButton:pressed { background: #0a1c35; }
 QPushButton:disabled { color: #607894; background: #0a1b32; }
+QPushButton#feedFilterButton:checked {
+    background: #07518a;
+    border-color: #00b9e8;
+}
 QPushButton#primaryButton {
     background: #007da8;
     border-color: #00b9e8;
@@ -104,6 +123,14 @@ QListWidget#securityFeed::item {
     border-bottom: 1px solid #102d4b;
 }
 QListWidget#securityFeed::item:hover { background: #0c2b4b; }
+QTableWidget#dashboardActivityTable {
+    font-size: 8pt;
+    alternate-background-color: #0b2240;
+}
+QTableWidget#dashboardActivityTable QHeaderView::section {
+    padding: 4px 5px;
+    font-size: 8pt;
+}
 QHeaderView::section {
     color: #a9c2df;
     background: #0b2240;

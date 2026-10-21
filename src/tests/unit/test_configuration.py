@@ -52,12 +52,12 @@ def test_settings_persist_across_store_instances(tmp_path):
 
     restarted = SettingsStore(path)
     assert restarted.load() == saved
-    assert saved.camera_index == 0
-    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 0
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 4
+    assert saved.camera_index == 7
+    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 7
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 6
 
 
-def test_existing_camera_index_is_reset_to_zero(tmp_path):
+def test_existing_camera_index_is_preserved(tmp_path):
     path = tmp_path / "settings.json"
     raw_settings = AppSettings(camera_index=3)
     path.write_text(
@@ -67,8 +67,8 @@ def test_existing_camera_index_is_reset_to_zero(tmp_path):
 
     settings = SettingsStore(path).load()
 
-    assert settings.camera_index == 0
-    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 0
+    assert settings.camera_index == 3
+    assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 3
 
 
 def test_legacy_version_one_settings_are_migrated(tmp_path):
@@ -86,12 +86,36 @@ def test_legacy_version_one_settings_are_migrated(tmp_path):
 
     migrated = SettingsStore(path).load()
 
-    assert migrated.schema_version == 4
+    assert migrated.schema_version == 6
     assert migrated.log_level == "WARNING"
     assert migrated.file_logging_enabled is True
     assert migrated.camera_access_enabled is False
     assert migrated.automatic_lock_enabled is False
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 4
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 6
+    assert migrated.recognition_model_download_prompted is False
+    assert migrated.recognition_model_download_allowed is False
+
+
+def test_version_four_settings_gain_model_download_preferences(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "log_level": "INFO",
+                "log_retention_days": 30,
+                "file_logging_enabled": True,
+                "backup_before_save": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = SettingsStore(path).load()
+
+    assert migrated.schema_version == 6
+    assert not migrated.recognition_model_download_prompted
+    assert not migrated.recognition_model_download_allowed
 
 
 @pytest.mark.parametrize(
@@ -101,6 +125,7 @@ def test_legacy_version_one_settings_are_migrated(tmp_path):
         ("log_retention_days", 0),
         ("log_retention_days", True),
         ("file_logging_enabled", "yes"),
+        ("recognition_model_download_prompted", "yes"),
         ("schema_version", 99),
         ("unexpected", "value"),
     ],
@@ -108,7 +133,7 @@ def test_legacy_version_one_settings_are_migrated(tmp_path):
 def test_invalid_settings_are_rejected(tmp_path, key, value):
     path = tmp_path / "settings.json"
     raw = {
-        "schema_version": 2,
+        "schema_version": 5,
         "log_level": "INFO",
         "log_retention_days": 30,
         "file_logging_enabled": True,

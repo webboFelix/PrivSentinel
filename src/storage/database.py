@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from pathlib import Path
 import sqlite3
 import threading
-from typing import Iterator
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 
 class SQLiteDatabase:
@@ -94,6 +94,11 @@ class SQLiteDatabase:
                     size INTEGER NOT NULL,
                     captured_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS file_integrity_baseline_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    roots_json TEXT NOT NULL,
+                    exclusions_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL REFERENCES security_events(id),
@@ -148,6 +153,103 @@ class SQLiteDatabase:
                     outcome TEXT NOT NULL,
                     details TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS threat_indicators (
+                    id TEXT PRIMARY KEY,
+                    indicator_type TEXT NOT NULL CHECK(
+                        indicator_type IN ('ip', 'domain', 'sha256')
+                    ),
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (indicator_type, value)
+                );
+                CREATE TABLE IF NOT EXISTS malware_rule_updates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sha256 TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS malware_scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL CHECK(provider IN ('yara', 'defender')),
+                    status TEXT NOT NULL CHECK(status IN
+                        ('requested', 'running', 'completed', 'failed', 'cancelled')),
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    scanned_files INTEGER NOT NULL DEFAULT 0,
+                    finding_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS malware_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id INTEGER NOT NULL REFERENCES malware_scans(id),
+                    provider TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    rule TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('detected', 'quarantined', 'restored', 'dismissed')),
+                    detected_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_malware_findings_status_time
+                    ON malware_findings (status, detected_at DESC);
+                CREATE TABLE IF NOT EXISTS quarantined_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    finding_id INTEGER NOT NULL REFERENCES malware_findings(id),
+                    original_path TEXT NOT NULL,
+                    quarantine_path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('quarantined', 'restored')),
+                    quarantined_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reputation_indicators (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    indicator_type TEXT NOT NULL CHECK(indicator_type IN
+                        ('url', 'domain', 'ip', 'sha256')),
+                    value TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    UNIQUE(provider, indicator_type, value)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reputation_indicator_value
+                    ON reputation_indicators (indicator_type, value);
+                CREATE TABLE IF NOT EXISTS reputation_feed_status (
+                    provider TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    entry_count INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reputation_cache (
+                    provider TEXT NOT NULL,
+                    indicator_type TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    malicious INTEGER,
+                    suspicious INTEGER,
+                    detail TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    PRIMARY KEY(provider, indicator_type, value)
+                );
+                CREATE TABLE IF NOT EXISTS browser_domain_decisions (
+                    domain TEXT PRIMARY KEY,
+                    decision TEXT NOT NULL CHECK(decision IN ('allow', 'block')),
+                    reason TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS browser_site_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    occurred_at TEXT NOT NULL,
+                    browser TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    decision TEXT NOT NULL CHECK(decision IN
+                        ('allowed', 'blocked', 'matched', 'error')),
+                    provider TEXT NOT NULL,
+                    detail TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_browser_site_events_time
+                    ON browser_site_events (occurred_at DESC);
                 """
             )
             alert_columns = {

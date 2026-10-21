@@ -38,3 +38,17 @@ def test_table_rejects_malformed_rows(qtbot):
 
     with pytest.raises(ValueError, match="Expected 2 cells"):
         table.set_rows((("single-cell",),))
+
+
+def test_table_selects_a_visible_record_by_id(qtbot):
+    table = DataTable(("Process", "Risk"))
+    qtbot.addWidget(table)
+    table.set_rows(
+        (("browser.exe", "Low"), ("powershell.exe", "High")),
+        ("browser", "shell"),
+    )
+    table.filter_input.setText("browser")
+
+    assert table.select_id("browser")
+    assert table.selected_ids == ("browser",)
+    assert not table.select_id("shell")

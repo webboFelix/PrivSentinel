@@ -11,7 +11,6 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
-from src.config.defaults import DEFAULT_CAMERA_INDEX
 from src.config.settings import AppSettings
 from src.identity.camera import CameraCapture
 from src.identity.face_detector import DetectedFace, FaceDetector, ImageQuality
@@ -85,14 +84,14 @@ class CameraPreviewWorker(QThread):
             allow_download=self.allow_download,
         )
         model_ready = threading.Event()
-        model_errors: list[RuntimeError] = []
+        model_errors: list[Exception] = []
         model_loader: threading.Thread | None = None
         preview_frame: np.ndarray | None = None
 
         def load_model() -> None:
             try:
                 engine.load()
-            except RuntimeError as exc:
+            except Exception as exc:
                 model_errors.append(exc)
             finally:
                 model_ready.set()
@@ -133,14 +132,6 @@ class CameraPreviewWorker(QThread):
                 return
             if model_errors:
                 raise model_errors[0]
-            if preview_frame is not None:
-                self.previewReady.emit(
-                    frame_to_image(preview_frame),
-                    [],
-                    preview_frame.copy(),
-                    ImageQuality(True, "Face guidance is ready.", 0.0, 0.0),
-                    {"model_ready": True},
-                )
             eye_cascade_path = (
                 Path(cv2.data.haarcascades) / "haarcascade_eye_tree_eyeglasses.xml"
             )
@@ -148,6 +139,14 @@ class CameraPreviewWorker(QThread):
             if eye_cascade.empty():
                 raise RuntimeError(
                     f"Could not load eye detector cascade: {eye_cascade_path}"
+                )
+            if preview_frame is not None:
+                self.previewReady.emit(
+                    frame_to_image(preview_frame),
+                    [],
+                    preview_frame.copy(),
+                    ImageQuality(True, "Face guidance is ready.", 0.0, 0.0),
+                    {"model_ready": True},
                 )
             while not self._stop_event.is_set():
                 frame = capture.read()
@@ -372,7 +371,7 @@ class CameraMonitorWorker(QThread):
 
         while not self._stop_event.is_set():
             capture = self.camera_factory(
-                DEFAULT_CAMERA_INDEX,
+                self.settings.camera_index,
                 self.settings.camera_width,
                 self.settings.camera_height,
             )

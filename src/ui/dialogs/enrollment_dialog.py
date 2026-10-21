@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import winsound
 from datetime import UTC, datetime
+from getpass import getuser
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -27,9 +28,12 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
-from src.config.defaults import DEFAULT_CAMERA_INDEX
 from src.identity.face_detector import DetectedFace, ImageQuality
-from src.identity.face_verifier import MODEL_NAME, FaceRecognitionEngine
+from src.identity.face_verifier import (
+    MODEL_NAME,
+    FaceRecognitionEngine,
+    recognition_model_is_installed,
+)
 from src.identity.workers import (
     CameraPreviewWorker,
     SpeechPromptWorker,
@@ -86,10 +90,12 @@ class EnrollmentDialog(QDialog):
         self._enrollment_embeddings: list[np.ndarray] = []
         self._step_index = 0
         self._enrollment_succeeded = False
+        self._setup_failed = False
         self._preview_worker_finished = False
         self._pending_dialog_result: int | None = None
         self._last_quality: ImageQuality | None = None
         self._camera_discovery_started = False
+        self._model_preparation_pending = False
         self._speech_ready = False
         self._stable_frames = 0
         self._stability_anchor: tuple[float, float, int, int, int, int] | None = None
@@ -109,7 +115,8 @@ class EnrollmentDialog(QDialog):
         title.setObjectName("sectionTitle")
         intro = QLabel(
             "Frames are processed locally and kept in memory only. The application "
-            "stores an encrypted face embedding, not the captured photo."
+            "stores an encrypted face embedding, not the captured photo. Optional "
+            "profile details are encrypted for this Windows account."
         )
         intro.setObjectName("muted")
         intro.setWordWrap(True)
@@ -154,10 +161,31 @@ class EnrollmentDialog(QDialog):
 
         identity_form = QFormLayout()
         self.display_name = QLineEdit()
-        self.display_name.setPlaceholderText("Name for this local profile")
+        self.display_name.setPlaceholderText("Full name")
         self.identity_name_label = QLabel("Identity name")
+        self.identity_name_label.setText("Full name")
         identity_form.addRow(self.identity_name_label, self.display_name)
+        self.email = QLineEdit()
+        self.email.setPlaceholderText("name@example.com (optional)")
+        identity_form.addRow("Work email (optional)", self.email)
+        self.department = QLineEdit()
+        self.department.setPlaceholderText("Department or team (optional)")
+        identity_form.addRow("Department (optional)", self.department)
+        self.employee_id = QLineEdit()
+        self.employee_id.setPlaceholderText("Employee ID (optional)")
+        identity_form.addRow("Employee ID (optional)", self.employee_id)
+        self.machine_user = QLineEdit(getuser())
+        self.machine_user.setPlaceholderText("Windows account name")
+        identity_form.addRow("Windows account", self.machine_user)
+        self.profile_privacy_note = QLabel(
+            "Profile details are optional and DPAPI-encrypted for this Windows account. "
+            "They are not sent to a server."
+        )
+        self.profile_privacy_note.setObjectName("muted")
+        self.profile_privacy_note.setWordWrap(True)
+        identity_form.addRow(self.profile_privacy_note)
         layout.addLayout(identity_form)
+        self.email.textChanged.connect(self._maybe_start_enrollment)
 
         self.consent_checkbox = QCheckBox(
             "I consent to local encrypted face-template enrollment."
@@ -172,16 +200,21 @@ class EnrollmentDialog(QDialog):
             "I explicitly allow downloading the InsightFace buffalo_l model to this "
             "device if needed. Camera images will not be uploaded."
         )
-        model_path = (
-            self.services.paths.models_directory / "models" / MODEL_NAME
+        self._model_download_consent_required = not recognition_model_is_installed(
+            self.services.paths.models_directory
         )
-        self._model_download_consent_required = not model_path.is_dir()
         if not self._model_download_consent_required:
             self.model_download_checkbox.setChecked(True)
             self.model_download_checkbox.setEnabled(False)
             self.model_download_checkbox.setText(
                 "Recognition model is already installed; no model download is needed."
             )
+        elif self.services.settings.recognition_model_download_allowed:
+            self.model_download_checkbox.setChecked(True)
+        self.consent_checkbox.stateChanged.connect(self._update_enroll_requirements)
+        self.model_download_checkbox.stateChanged.connect(
+            self._update_enroll_requirements
+        )
         self.glasses_checkbox = QCheckBox(
             "I normally wear glasses (include glasses-on/off samples)"
         )
@@ -193,6 +226,11 @@ class EnrollmentDialog(QDialog):
         self.enrollment_requirements.setObjectName("muted")
         self.enrollment_requirements.setWordWrap(True)
         layout.addWidget(self.enrollment_requirements)
+        self.start_button = QPushButton("Start guided enrollment")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.setEnabled(False)
+        self.start_button.clicked.connect(self._begin_enrollment)
+        layout.addWidget(self.start_button)
         scroll_area.setWidget(content)
         scroll_area.setMaximumHeight(min(260, int(initial_height * 0.34)))
         dialog_layout.addWidget(scroll_area)
@@ -211,15 +249,16 @@ class EnrollmentDialog(QDialog):
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
         dialog_layout.addWidget(self.status)
-        self.consent_checkbox.stateChanged.connect(self._maybe_start_enrollment)
-        self.model_download_checkbox.stateChanged.connect(self._maybe_start_enrollment)
         self.display_name.textChanged.connect(self._update_enroll_requirements)
-        self.display_name.editingFinished.connect(self._maybe_start_enrollment)
+        self.email.textChanged.connect(self._update_enroll_requirements)
         self.glasses_checkbox.setEnabled(True)
         self._update_step_prompt()
         self._update_enroll_requirements()
 
     def _close_dialog(self, *_args) -> None:
+        if self._setup_failed:
+            self._restart_enrollment()
+            return
         if self._enrollment_succeeded:
             self.accept()
         else:
@@ -286,26 +325,60 @@ class EnrollmentDialog(QDialog):
 
     def _maybe_start_enrollment(self, *_args) -> None:
         self._update_enroll_requirements()
+
+    def _begin_enrollment(self, *_args) -> None:
+        self._update_enroll_requirements()
+        if not self.start_button.isEnabled():
+            return
         if self._camera_discovery_started or self._enrollment_succeeded:
             return
-        if not self.services.settings.camera_access_enabled:
-            return
-        if not self.display_name.text().strip() or not self.consent_checkbox.isChecked():
-            return
-        if (
-            self._model_download_consent_required
-            and not self.model_download_checkbox.isChecked()
-        ):
+        if self._model_preparation_pending:
+            self.readiness_indicator.setText(
+                "The local model is downloading in the background. Enrollment "
+                "can start when preparation finishes."
+            )
+            self.status.setText("Waiting for background face-model preparation…")
             return
         self._camera_discovery_started = True
+        self.start_button.setEnabled(False)
         for widget in (
             self.display_name,
             self.consent_checkbox,
             self.model_download_checkbox,
             self.glasses_checkbox,
+            self.email,
+            self.department,
+            self.employee_id,
+            self.machine_user,
         ):
             widget.setEnabled(False)
         self._start_preview()
+
+    def set_model_preparation_pending(self) -> None:
+        self._model_preparation_pending = True
+        self.step_prompt.setText("Preparing local face guidance…")
+        self.readiness_progress.setRange(0, 0)
+        self.readiness_indicator.setText(
+            "The local model is downloading in the background. Enrollment will "
+            "be ready to start when preparation finishes."
+        )
+        self.status.setText("Waiting for background face-model preparation…")
+
+    def model_preparation_finished(self, succeeded: bool, message: str) -> None:
+        self._model_preparation_pending = False
+        self.readiness_progress.setRange(0, 100)
+        self.readiness_progress.setValue(0)
+        if succeeded and recognition_model_is_installed(
+            self.services.paths.models_directory
+        ):
+            self._model_download_consent_required = False
+            self.model_download_checkbox.setChecked(True)
+            self.model_download_checkbox.setEnabled(False)
+            self.model_download_checkbox.setText(
+                "Recognition model is installed and ready."
+            )
+        self.status.setText(message)
+        self._update_enroll_requirements()
 
     def _update_enroll_requirements(self) -> None:
         requirements = []
@@ -313,6 +386,8 @@ class EnrollmentDialog(QDialog):
             requirements.append("enable camera access in Settings")
         if not self.display_name.text().strip():
             requirements.append("enter an identity name")
+        if not self._email_is_valid():
+            requirements.append("enter a valid email address or leave it blank")
         if not self.consent_checkbox.isChecked():
             requirements.append("consent to local encrypted face-template enrollment")
         if (
@@ -321,10 +396,25 @@ class EnrollmentDialog(QDialog):
         ):
             requirements.append("consent to download the local recognition model")
         self.enrollment_requirements.setText(
-            "Ready to start guided enrollment."
+            "Select Start guided enrollment when you are ready."
             if not requirements
             else "To begin: " + "; ".join(requirements) + "."
         )
+        self.start_button.setEnabled(
+            not requirements
+            and not self._camera_discovery_started
+            and not self._model_preparation_pending
+            and not self._enrollment_succeeded
+        )
+
+    def _email_is_valid(self) -> bool:
+        email = self.email.text().strip()
+        if not email:
+            return True
+        if email.count("@") != 1 or any(character.isspace() for character in email):
+            return False
+        local_part, domain = email.split("@")
+        return bool(local_part and "." in domain and not domain.startswith("."))
 
     def _initial_status(self) -> str:
         if not self.services.settings.camera_access_enabled:
@@ -352,7 +442,7 @@ class EnrollmentDialog(QDialog):
             return
         settings = self.services.settings
         worker = CameraPreviewWorker(
-            DEFAULT_CAMERA_INDEX,
+            settings.camera_index,
             settings.camera_width,
             settings.camera_height,
             self,
@@ -372,7 +462,7 @@ class EnrollmentDialog(QDialog):
             lambda worker=worker: self._preview_finished(worker)
         )
         worker.finished.connect(worker.deleteLater)
-        self.status.setText(f"Opening camera {DEFAULT_CAMERA_INDEX}…")
+        self.status.setText(f"Opening camera {settings.camera_index}…")
         self.services.identity_service.set_camera_state(
             "connecting", "Opening the camera for identity enrollment."
         )
@@ -467,7 +557,7 @@ class EnrollmentDialog(QDialog):
             self.step_prompt.setText("Preparing local face guidance…")
             self.readiness_progress.setRange(0, 0)
             self.readiness_indicator.setText(
-                f"✓ Camera {DEFAULT_CAMERA_INDEX} is delivering a live image. "
+                f"✓ Camera {self.services.settings.camera_index} is delivering a live image. "
                 "Preparing the local face model; no samples are captured yet."
             )
             return
@@ -675,6 +765,12 @@ class EnrollmentDialog(QDialog):
                 embedding,
                 MODEL_NAME,
                 datetime.now(UTC),
+                {
+                    "email": self.email.text(),
+                    "department": self.department.text(),
+                    "employee_id": self.employee_id.text(),
+                    "machine_user": self.machine_user.text(),
+                },
             )
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self._enrollment_failed(str(exc))
@@ -713,6 +809,11 @@ class EnrollmentDialog(QDialog):
             self.readiness_progress,
             self.identity_name_label,
             self.display_name,
+            self.email,
+            self.department,
+            self.employee_id,
+            self.machine_user,
+            self.profile_privacy_note,
             self.consent_checkbox,
             self.model_download_checkbox,
             self.glasses_checkbox,
@@ -748,7 +849,10 @@ class EnrollmentDialog(QDialog):
         self._enrollment_embeddings.clear()
         self._step_index = 0
         self._enrollment_succeeded = False
+        self._setup_failed = False
         self._speech_ready = False
+        self.close_button.setText("Close")
+        self.start_button.setEnabled(False)
         self._update_step_prompt()
         self._camera_discovery_started = True
         if self._preview_worker and not self._preview_worker_finished:
@@ -758,8 +862,10 @@ class EnrollmentDialog(QDialog):
             self._start_preview()
 
     def _camera_error(self, message: str) -> None:
+        self._setup_failed = True
         self.readiness_progress.setRange(0, 100)
         self.readiness_progress.setValue(0)
+        self.close_button.setText("Retry setup")
         self.status.setText("Guided enrollment stopped: camera or vision setup failed.")
         self.readiness_indicator.setText(
             "Check camera access, the recognition-model setup, and OpenCV installation."
@@ -772,7 +878,8 @@ class EnrollmentDialog(QDialog):
             "PrivSentinel could not access the camera or initialize local face guidance."
         )
         box.setInformativeText(
-            f"PrivSentinel opens camera {DEFAULT_CAMERA_INDEX}. Allow desktop-app "
+            f"PrivSentinel opens camera {self.services.settings.camera_index}. "
+            "Allow desktop-app "
             "camera access in Windows privacy settings and close other apps using the "
             "camera. The recognition model will download only after a live camera "
             "frame is received. No enrollment template was saved."
@@ -782,11 +889,14 @@ class EnrollmentDialog(QDialog):
             QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close
         )
         if box.exec() == QMessageBox.StandardButton.Retry:
-            self._camera_discovery_started = True
-            QTimer.singleShot(0, self._start_preview)
+            self._restart_enrollment()
         else:
             self._camera_discovery_started = False
-            self.reject()
+            self.start_button.setEnabled(False)
+            self.readiness_indicator.setText(
+                "Setup did not complete. Resolve the issue, then select Retry setup. "
+                "Close this window with its title-bar close control to exit."
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if (

@@ -2,8 +2,9 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QProcess, Signal
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QMessageBox
 
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
@@ -20,7 +21,8 @@ def test_identity_page_distinguishes_permission_from_camera_connection(qtbot, tm
     page = window._pages["identity-protection"]
 
     services.save_settings(replace(services.settings, camera_access_enabled=True))
-    assert page.camera_status.text() == "Camera: access enabled · idle"
+    assert page.camera_status.text() == "Camera permission enabled · camera idle"
+    assert "select Enroll / Re-enroll" in page.camera_status.toolTip()
 
     services.identity_service.set_camera_state("connected", "Camera opened.")
     assert page.camera_status.text() == "Camera: connected"
@@ -30,13 +32,13 @@ def test_identity_page_distinguishes_permission_from_camera_connection(qtbot, tm
     services.identity_service._on_state_changed(
         "verification_failure", "Recognition model is not available."
     )
-    assert page.camera_status.text() == "Camera: access enabled · idle"
+    assert page.camera_status.text() == "Camera permission enabled · camera idle"
     assert "verification setup failed" in page.camera_status.toolTip()
 
     window.close()
 
 
-def test_enrollment_starts_automatically_after_consent_and_name(qtbot, monkeypatch, tmp_path):
+def test_enrollment_starts_after_explicit_consent_and_start(qtbot, monkeypatch, tmp_path):
     services = ApplicationServices.create(AppPaths(tmp_path / "local"))
     services.save_settings(replace(services.settings, camera_access_enabled=True))
     services.settings = replace(services.settings, camera_index=4)
@@ -98,10 +100,13 @@ def test_enrollment_starts_automatically_after_consent_and_name(qtbot, monkeypat
     assert not dialog._camera_discovery_started
     assert dialog.model_download_checkbox.isEnabled()
     dialog.model_download_checkbox.setChecked(True)
+    assert dialog.start_button.isEnabled()
+    assert not dialog._camera_discovery_started
+    dialog.start_button.click()
 
     assert dialog._camera_discovery_started
     assert dialog._preview_worker is not None
-    assert dialog._preview_worker.camera_index == 0
+    assert dialog._preview_worker.camera_index == 4
     assert dialog._preview_worker.started
     assert not dialog._speech_ready
     assert dialog.step_prompt.text() == "Preparing local face guidance…"
@@ -142,12 +147,23 @@ def test_enrollment_starts_automatically_after_consent_and_name(qtbot, monkeypat
     services.identity_service.set_camera_state("idle", "Test cleanup.")
 
 
-def test_settings_page_hides_camera_index_control(qtbot, tmp_path):
+def test_settings_page_exposes_camera_device_index(qtbot, tmp_path):
     services = ApplicationServices.create(AppPaths(tmp_path / "local"))
     page = SettingsPage(services)
     qtbot.addWidget(page)
 
-    assert not hasattr(page, "camera_index")
+    assert page.camera_device.value() == services.settings.camera_index
+
+
+def test_settings_save_persists_selected_camera_device(qtbot, tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    page = SettingsPage(services)
+    qtbot.addWidget(page)
+    page.camera_device.setValue(3)
+
+    page._save()
+
+    assert services.settings.camera_index == 3
 
 
 def test_enrollment_dialog_scales_preview_when_window_resizes(qtbot, tmp_path):
@@ -191,6 +207,136 @@ def test_enrollment_dialog_scales_preview_when_window_resizes(qtbot, tmp_path):
         abs=0.01,
     )
     dialog.reject()
+
+
+def test_dismissing_setup_error_keeps_enrollment_dialog_open(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    monkeypatch.setattr(
+        "src.ui.dialogs.enrollment_dialog.QMessageBox.exec",
+        lambda _box: QMessageBox.StandardButton.Close,
+    )
+
+    dialog._camera_error("Recognition model could not initialize.")
+
+    assert dialog.isVisible()
+    assert dialog._pending_dialog_result is None
+    assert dialog.close_button.text() == "Retry setup"
+    assert "select Retry setup" in dialog.readiness_indicator.text()
+    retry_calls = []
+    monkeypatch.setattr(dialog, "_start_preview", lambda: retry_calls.append(True))
+    dialog.close_button.click()
+    assert retry_calls == [True]
+    assert dialog.isVisible()
+    dialog.reject()
+
+
+def test_startup_model_consent_is_reused_during_enrollment(qtbot, tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    services.save_settings(
+        replace(
+            services.settings,
+            recognition_model_download_prompted=True,
+            recognition_model_download_allowed=True,
+        )
+    )
+
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+
+    assert dialog._model_download_consent_required
+    assert dialog.model_download_checkbox.isChecked()
+    assert dialog.model_download_checkbox.isEnabled()
+    dialog.reject()
+
+
+def test_enrollment_waits_in_open_dialog_for_startup_model(
+    qtbot, tmp_path, monkeypatch
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    services.save_settings(replace(services.settings, camera_access_enabled=True))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    starts = []
+    monkeypatch.setattr(dialog, "_start_preview", lambda: starts.append(True))
+    dialog.set_model_preparation_pending()
+    dialog.display_name.setText("Local user")
+    dialog.consent_checkbox.setChecked(True)
+    dialog.model_download_checkbox.setChecked(True)
+
+    assert not starts
+    assert dialog.isVisible()
+    assert dialog._model_preparation_pending
+    assert "ready to start when preparation finishes" in dialog.readiness_indicator.text()
+
+    model_directory = services.paths.models_directory / "models" / "buffalo_l"
+    model_directory.mkdir(parents=True)
+    (model_directory / "det_10g.onnx").write_bytes(b"detector")
+    (model_directory / "w600k_r50.onnx").write_bytes(b"recognizer")
+    dialog.model_preparation_finished(True, "Model ready.")
+
+    assert starts == []
+    assert not dialog._model_preparation_pending
+    assert dialog.model_download_checkbox.isEnabled() is False
+    assert dialog.start_button.isEnabled()
+    dialog.start_button.click()
+    assert starts == [True]
+    dialog.reject()
+
+
+def test_enroll_action_opens_dialog_while_model_preparation_runs(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    window = MainWindow(services)
+    qtbot.addWidget(window)
+    calls = []
+
+    class ActiveProcess:
+        def state(self):
+            return QProcess.ProcessState.Running
+
+        def terminate(self):
+            pass
+
+        def waitForFinished(self, _timeout):
+            return True
+
+    class FakeEnrollmentDialog(QObject):
+        enrollmentCompleted = Signal()
+        finished = Signal(int)
+
+        def __init__(self, *_args):
+            super().__init__()
+            self.waiting_for_model = False
+
+        def set_model_preparation_pending(self):
+            self.waiting_for_model = True
+
+        def model_preparation_finished(self, _succeeded, _message):
+            pass
+
+        def exec(self):
+            calls.append(self.waiting_for_model)
+            self.finished.emit(0)
+            return 0
+
+    window._model_preparation_process = ActiveProcess()
+    monkeypatch.setattr(
+        "src.ui.main_window.EnrollmentDialog",
+        FakeEnrollmentDialog,
+    )
+
+    window._handle_page_action("identity-enrollment")
+
+    assert calls == [True]
+    window._model_preparation_process = None
+    window.close()
 
 
 def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
@@ -355,9 +501,12 @@ def test_enrollment_completion_shows_confidence_and_local_storage_details(
     dialog.show()
 
     class FakeRepository:
-        def enroll(self, display_name, embedding, model_name, consent_recorded_at):
+        def enroll(
+            self, display_name, embedding, model_name, consent_recorded_at, profile_details
+        ):
             assert display_name == "Local user"
             assert embedding.shape == (32,)
+            assert profile_details["machine_user"]
 
     dialog.repository = FakeRepository()
     dialog.display_name.setText("Local user")

@@ -10,6 +10,16 @@ import cv2
 import numpy as np
 
 MODEL_NAME = "buffalo_l"
+_REQUIRED_MODEL_FILES = ("det_10g.onnx", "w600k_r50.onnx")
+
+
+def recognition_model_is_installed(models_directory: str | Path) -> bool:
+    model_directory = Path(models_directory) / "models" / MODEL_NAME
+    return all(
+        (model_directory / filename).is_file()
+        and (model_directory / filename).stat().st_size > 0
+        for filename in _REQUIRED_MODEL_FILES
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +66,15 @@ class FaceRecognitionEngine:
         if self._analysis is not None:
             return
         model_directory = self.models_directory / "models" / self.model_name
+        if (
+            not self.allow_download
+            and self.model_name == MODEL_NAME
+            and not recognition_model_is_installed(self.models_directory)
+        ):
+            raise RecognitionModelUnavailable(
+                f"Recognition model '{self.model_name}' is not fully installed. "
+                "Select the explicit model-download consent option to continue."
+            )
         if not self.allow_download and not model_directory.is_dir():
             raise RecognitionModelUnavailable(
                 f"Recognition model '{self.model_name}' is not installed. "

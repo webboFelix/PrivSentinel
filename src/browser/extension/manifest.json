@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "PrivSentinel Web Protection",
+  "version": "1.0.0",
+  "description": "Blocks locally listed malicious domains and records browser site decisions in PrivSentinel.",
+  "permissions": [
+    "alarms",
+    "declarativeNetRequest",
+    "nativeMessaging",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "PrivSentinel Web Protection",
+    "default_popup": "popup.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["blocked.html", "blocked.css", "blocked.js"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "privsentinel-web-protection@privsentinel.local",
+      "strict_min_version": "128.0"
+    }
+  }
+}

@@ -11,6 +11,10 @@ class IdentityProfile:
     model_name: str
     template_dimensions: int
     consent_recorded_at: datetime
+    email: str = ""
+    department: str = ""
+    employee_id: str = ""
+    machine_user: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,8 +3,8 @@
 from dataclasses import replace
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,10 +23,10 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
-from src.config.defaults import DEFAULT_CAMERA_INDEX
 from src.config.settings import AppSettings
 from src.ui.components.status_indicator import StatusIndicator
 from src.ui.dialogs.confirmation_dialog import ConfirmationDialog
+from src.ui.icon_assets import icon_path
 
 
 class SettingsPage(QWidget):
@@ -86,10 +86,11 @@ class SettingsPage(QWidget):
         self.camera_access = QCheckBox("Allow this app to access a camera")
         self.camera_access.setChecked(services.settings.camera_access_enabled)
         identity_form.addRow("Camera access", self.camera_access)
-        identity_form.addRow(
-            "Camera device",
-            QLabel(f"Camera {DEFAULT_CAMERA_INDEX} (fixed)"),
-        )
+        self.camera_device = QSpinBox()
+        self.camera_device.setRange(0, 31)
+        self.camera_device.setPrefix("Camera ")
+        self.camera_device.setValue(services.settings.camera_index)
+        identity_form.addRow("Camera device index", self.camera_device)
         self.identity_monitoring = QCheckBox("Enable continuous identity monitoring")
         self.identity_monitoring.setChecked(
             services.settings.identity_monitoring_enabled
@@ -285,7 +286,16 @@ class SettingsPage(QWidget):
         self.file_integrity_monitoring.setChecked(
             services.settings.file_integrity_monitoring_enabled
         )
-        endpoint_form.addRow("File integrity", self.file_integrity_monitoring)
+        self.file_integrity_baseline_button = QPushButton("Create baseline…")
+        self.file_integrity_baseline_button.setIcon(
+            QIcon(icon_path("radar-scan.png"))
+        )
+        self.file_integrity_baseline_button.clicked.connect(self._open_file_integrity_page)
+        integrity_monitoring_row = QHBoxLayout()
+        integrity_monitoring_row.addWidget(self.file_integrity_monitoring)
+        integrity_monitoring_row.addWidget(self.file_integrity_baseline_button)
+        integrity_monitoring_row.addStretch(1)
+        endpoint_form.addRow("File integrity", integrity_monitoring_row)
         self.file_integrity_roots = QPlainTextEdit()
         self.file_integrity_roots.setPlaceholderText(
             "Monitored directories, one absolute path per line"
@@ -369,6 +379,49 @@ class SettingsPage(QWidget):
         layout.addWidget(note)
         layout.addStretch(1)
 
+    def showEvent(self, event: QEvent) -> None:
+        super().showEvent(event)
+        self._show_settings(self.services.settings)
+
+    def _open_file_integrity_page(self) -> None:
+        window = self.window()
+        if window is None or not hasattr(window, "navigate_to"):
+            return
+        file_page = getattr(window, "_pages", {}).get("file-integrity")
+        if file_page is not None:
+            window.navigate_to("file-integrity")
+            file_page.roots.setPlainText(self.file_integrity_roots.toPlainText())
+            file_page.exclusions.setPlainText(
+                self.file_integrity_exclusions.toPlainText()
+            )
+            resume_monitoring = self.file_integrity_monitoring.isChecked()
+            file_page.enabled.setChecked(resume_monitoring)
+            file_page.enabled.setText(
+                "Disable monitoring" if resume_monitoring else "Enable monitoring"
+            )
+            file_page.start_baseline()
+
+    def _warn_missing_baseline(self) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Current file baseline required")
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setText(
+            "Create or refresh the file-integrity baseline for the selected folders "
+            "and exclusions before enabling monitoring."
+        )
+        create_button = dialog.addButton("Create baseline", QMessageBox.ActionRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        if dialog.clickedButton() is create_button:
+            self._open_file_integrity_page()
+        else:
+            self.file_integrity_monitoring.setChecked(False)
+            self.status.set_text(
+                "Settings saved; file-integrity monitoring remains off until a "
+                "baseline is created."
+            )
+            self.status.set_state("warning")
+
     def _save(self) -> None:
         if (
             self.start_monitoring.isChecked()
@@ -392,13 +445,11 @@ class SettingsPage(QWidget):
             for line in self.file_integrity_roots.toPlainText().splitlines()
             if line.strip()
         )
-        if self.file_integrity_monitoring.isChecked() and not roots:
-            QMessageBox.warning(
-                self,
-                "File integrity roots required",
-                "Add at least one folder before enabling file-integrity monitoring.",
-            )
-            return
+        exclusions = self._lines(self.file_integrity_exclusions)
+        needs_baseline = self.file_integrity_monitoring.isChecked() and (
+            not roots
+            or not self.services.endpoint_service.has_file_baseline(roots, exclusions)
+        )
         if self.automatic_lock.isChecked():
             if (
                 self.unknown_face_action.currentData() != "lock_after_grace"
@@ -428,7 +479,7 @@ class SettingsPage(QWidget):
             log_retention_days=self.retention_days.value(),
             file_logging_enabled=self.file_logging.isChecked(),
             backup_before_save=self.backup_before_save.isChecked(),
-            camera_index=DEFAULT_CAMERA_INDEX,
+            camera_index=self.camera_device.value(),
             camera_reconnect_seconds=self.camera_reconnect.value(),
             camera_failure_action=self.camera_failure_action.currentData(),
             multiple_face_policy=self.multiple_face_policy.currentData(),
@@ -452,7 +503,9 @@ class SettingsPage(QWidget):
             endpoint_poll_interval_seconds=self.endpoint_interval.value(),
             process_monitoring_enabled=self.process_monitoring.isChecked(),
             network_monitoring_enabled=self.network_monitoring.isChecked(),
-            file_integrity_monitoring_enabled=self.file_integrity_monitoring.isChecked(),
+            file_integrity_monitoring_enabled=(
+                self.file_integrity_monitoring.isChecked() and not needs_baseline
+            ),
             windows_log_collection_enabled=self.windows_log_monitoring.isChecked(),
             event_retention_days=self.event_retention.value(),
             process_exclusions=self._lines(self.process_exclusions),
@@ -464,7 +517,15 @@ class SettingsPage(QWidget):
         except (OSError, ValueError) as exc:
             self._show_error("Could not save settings", exc)
             return
+        if needs_baseline:
+            self.status.set_text(
+                "Settings saved; create a file-integrity baseline before enabling monitoring."
+            )
+            self.status.set_state("warning")
+            self._warn_missing_baseline()
+            return
         self.status.set_text("Settings saved; logging configuration updated")
+        self.status.set_state("success")
 
     def _reset(self) -> None:
         if not ConfirmationDialog.confirm(
@@ -528,6 +589,7 @@ class SettingsPage(QWidget):
         self.file_logging.setChecked(settings.file_logging_enabled)
         self.backup_before_save.setChecked(settings.backup_before_save)
         self.camera_access.setChecked(settings.camera_access_enabled)
+        self.camera_device.setValue(settings.camera_index)
         self.identity_monitoring.setChecked(settings.identity_monitoring_enabled)
         self.start_monitoring.setChecked(settings.start_monitoring_on_launch)
         self.camera_reconnect.setValue(settings.camera_reconnect_seconds)

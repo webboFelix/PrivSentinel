@@ -18,7 +18,7 @@ class NotificationPanel(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("panel")
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(120)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(13, 10, 13, 8)
         layout.setSpacing(6)

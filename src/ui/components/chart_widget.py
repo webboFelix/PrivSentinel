@@ -38,7 +38,7 @@ class ChartWidget(QFrame):
         self._azimuth = 35.0
         self._has_data = False
         self.setObjectName("panel")
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(130)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(13, 10, 13, 8)
@@ -65,7 +65,7 @@ class ChartWidget(QFrame):
         self.view.setFormat(surface_format)
         self.view.setBackgroundColor(QColor("#091d37"))
         self.view.setCameraPosition(distance=12, elevation=24, azimuth=self._azimuth)
-        self.view.setMinimumHeight(110)
+        self.view.setMinimumHeight(78)
         layout.addWidget(self.view, 1)
         self.empty_label = QLabel(message, self.view)
         self.empty_label.setObjectName("chartEmpty")

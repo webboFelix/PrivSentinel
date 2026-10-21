@@ -11,6 +11,11 @@ class WindowsEventLogCollector:
     def __init__(self, channels: tuple[str, ...] = ("System", "Application")) -> None:
         self.channels = channels
         self._last_record_number: dict[str, int] = {}
+        self._last_read_channels: tuple[str, ...] = ()
+
+    @property
+    def last_read_channels(self) -> tuple[str, ...]:
+        return self._last_read_channels
 
     def collect(self, records_per_channel: int = 32) -> list[SecurityEvent]:
         if os.name != "nt":
@@ -22,6 +27,8 @@ class WindowsEventLogCollector:
         if not 1 <= records_per_channel <= 256:
             raise ValueError("records_per_channel must be from 1 to 256.")
         events: list[SecurityEvent] = []
+        read_channels: list[str] = []
+        self._last_read_channels = ()
         flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
         for channel in self.channels:
             handle = win32evtlog.OpenEventLog(None, channel)
@@ -29,6 +36,8 @@ class WindowsEventLogCollector:
                 records = win32evtlog.ReadEventLog(handle, flags, 0)
             finally:
                 win32evtlog.CloseEventLog(handle)
+            read_channels.append(channel)
+            self._last_read_channels = tuple(read_channels)
             if not records:
                 continue
             previous = self._last_record_number.get(channel, 0)

@@ -28,6 +28,8 @@ class DataTable(QFrame):
         self._columns = tuple(columns)
         self._rows: list[tuple[str, ...]] = []
         self._row_ids: tuple[str, ...] = ()
+        self._source_indexes_by_id: dict[str, int] = {}
+        self._visible_indexes_by_id: dict[str, int] = {}
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("Filter this table…")
         self.filter_input.setClearButtonEnabled(True)
@@ -71,7 +73,35 @@ class DataTable(QFrame):
             raise ValueError("row_ids must contain one ID for each row.")
         self._rows = normalized
         self._row_ids = tuple(row_ids) if row_ids is not None else ()
+        self._source_indexes_by_id = (
+            {row_id: index for index, row_id in enumerate(self._row_ids)}
+            if row_ids is not None
+            else {}
+        )
         self._apply_filter(self.filter_input.text())
+
+    def update_cell(self, row_id: str, column_index: int, value: object) -> None:
+        if not 0 <= column_index < len(self._columns):
+            raise IndexError(f"Column index is out of range: {column_index}")
+        source_index = self._source_indexes_by_id.get(row_id)
+        if source_index is None:
+            return
+        row = list(self._rows[source_index])
+        row[column_index] = str(value)
+        self._rows[source_index] = tuple(row)
+        visible_index = self._visible_indexes_by_id.get(row_id)
+        if visible_index is not None:
+            item = self.table.item(visible_index, column_index)
+            if item is not None:
+                item.setText(str(value))
+
+    def select_id(self, row_id: str) -> bool:
+        row_index = self._visible_indexes_by_id.get(row_id)
+        if row_index is None:
+            return False
+        self.table.selectRow(row_index)
+        self.table.setCurrentCell(row_index, 0)
+        return True
 
     @property
     def selected_ids(self) -> tuple[str, ...]:
@@ -100,6 +130,11 @@ class DataTable(QFrame):
             for index, row in enumerate(self._rows)
             if not query or any(query in cell.casefold() for cell in row)
         ]
+        self._visible_indexes_by_id = {
+            self._row_ids[source_index]: row_index
+            for row_index, (source_index, _row) in enumerate(visible_rows)
+            if self._row_ids
+        }
         self.table.setRowCount(len(visible_rows))
         for row_index, (source_index, row) in enumerate(visible_rows):
             for column_index, value in enumerate(row):

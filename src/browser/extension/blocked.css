@@ -1,0 +1,28 @@
+body {
+  margin: 0;
+  color: #e6f0ff;
+  background: #07192d;
+  font: 16px "Segoe UI", sans-serif;
+}
+main {
+  box-sizing: border-box;
+  width: min(680px, calc(100% - 32px));
+  margin: 10vh auto;
+  padding: 28px;
+  border: 1px solid #23547c;
+  border-radius: 12px;
+  background: #0b213a;
+}
+h1 { color: #ffba4a; }
+#domain { color: #79bfff; overflow-wrap: anywhere; }
+.warning { color: #ffc96b; line-height: 1.5; }
+button {
+  margin: 8px 8px 0 0;
+  padding: 10px 14px;
+  border: 1px solid #2679aa;
+  border-radius: 6px;
+  color: #fff;
+  background: #0a3455;
+  cursor: pointer;
+}
+#error { color: #ff8292; }

@@ -33,7 +33,9 @@ class Sidebar(QFrame):
         "threat-intelligence": "internet-search.png",
         "investigations": "file-search.png",
         "reports": "analytics-report.png",
-        "evidence": "locked-file.png",
+        "audit-log": "analytics-report.png",
+        "malware-protection": "shield-check.png",
+        "web-protection": "internet-search.png",
         "settings": "settings-gear.png",
     }
 

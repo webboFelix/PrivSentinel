@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PrivSentinel Web Protection</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>PrivSentinel</h1>
+    <p id="status">Checking local protection…</p>
+    <p id="site" class="site"></p>
+    <button id="allow" hidden>Allow this domain</button>
+    <button id="refresh">Refresh block list</button>
+    <p class="note">Unknown sites are allowed but are not considered safe.</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

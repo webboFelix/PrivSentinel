@@ -10,8 +10,11 @@ from src.config.logging_config import configure_logging
 from src.config.paths import AppPaths
 from src.config.settings import AppSettings, SettingsStore
 from src.core.event_pipeline import EventPipeline
-from src.identity.service import IdentityService
 from src.endpoint.service import EndpointMonitoringService
+from src.identity.service import IdentityService
+from src.security.browser_protection import BrowserProtectionService
+from src.security.malware_scanner import MalwareScanner
+from src.security.reputation import ReputationService
 from src.security.secret_store import WindowsSecretStore
 from src.storage.database import SQLiteDatabase
 from src.storage.repositories.identity_repository import IdentityRepository
@@ -29,6 +32,9 @@ class ApplicationServices:
     security_repository: SecurityRepository
     event_pipeline: EventPipeline
     endpoint_service: EndpointMonitoringService
+    malware_scanner: MalwareScanner
+    reputation_service: ReputationService
+    browser_protection: BrowserProtectionService
     settings: AppSettings
 
     @classmethod
@@ -42,9 +48,10 @@ class ApplicationServices:
             settings_store.save(legacy_settings)
         settings = settings_store.load()
         database = SQLiteDatabase(app_paths.database_file)
+        secret_store = WindowsSecretStore(app_paths.secrets_directory)
         identity_repository = IdentityRepository(
             database,
-            WindowsSecretStore(app_paths.secrets_directory),
+            secret_store,
         )
         security_repository = SecurityRepository(database)
         event_pipeline = EventPipeline(security_repository)
@@ -59,16 +66,26 @@ class ApplicationServices:
             event_pipeline,
             settings,
         )
+        malware_scanner = MalwareScanner(app_paths, database, security_repository)
+        reputation_service = ReputationService(database, secret_store)
+        browser_protection = BrowserProtectionService(
+            database,
+            reputation_service,
+            security_repository,
+        )
         services = cls(
             paths=app_paths,
             settings_store=settings_store,
-            secret_store=WindowsSecretStore(app_paths.secrets_directory),
+            secret_store=secret_store,
             database=database,
             identity_repository=identity_repository,
             identity_service=identity_service,
             security_repository=security_repository,
             event_pipeline=event_pipeline,
             endpoint_service=endpoint_service,
+            malware_scanner=malware_scanner,
+            reputation_service=reputation_service,
+            browser_protection=browser_protection,
             settings=settings,
         )
         identity_repository.prune_events(settings.identity_event_retention_days)

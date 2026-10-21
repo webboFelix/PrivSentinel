@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from src.config.settings import AppSettings
-from src.identity.face_verifier import FaceRecognitionEngine
+from src.identity.face_verifier import (
+    FaceRecognitionEngine,
+    RecognitionModelUnavailable,
+    recognition_model_is_installed,
+)
 from src.identity.workers import (
     CameraMonitorWorker,
     CameraPreviewWorker,
@@ -25,6 +29,28 @@ def test_aggregate_embeddings_returns_normalized_template_and_consistency():
     assert np.isclose(np.linalg.norm(template), 1.0)
     assert np.isclose(consistency, np.sqrt(0.9))
     assert 0.0 <= consistency <= 1.0
+
+
+def test_recognition_model_is_installed_requires_core_model_files(tmp_path):
+    model_directory = tmp_path / "models" / "buffalo_l"
+    model_directory.mkdir(parents=True)
+    (model_directory / "det_10g.onnx").write_bytes(b"detector")
+
+    assert not recognition_model_is_installed(tmp_path)
+
+    (model_directory / "w600k_r50.onnx").write_bytes(b"recognizer")
+
+    assert recognition_model_is_installed(tmp_path)
+
+
+def test_incomplete_recognition_model_requires_download_consent(tmp_path):
+    model_directory = tmp_path / "models" / "buffalo_l"
+    model_directory.mkdir(parents=True)
+    (model_directory / "det_10g.onnx").write_bytes(b"detector")
+    engine = FaceRecognitionEngine(tmp_path)
+
+    with pytest.raises(RecognitionModelUnavailable, match="not fully installed"):
+        engine.load()
 
 
 @pytest.mark.parametrize(
@@ -254,9 +280,52 @@ def test_camera_failure_prevents_recognition_model_download(monkeypatch, tmp_pat
     ]
 
 
-def test_camera_monitor_uses_camera_zero_even_if_settings_are_legacy(
-    tmp_path
-):
+def test_model_initialization_failure_is_reported_before_ready(monkeypatch, tmp_path):
+    preview_frames = []
+    camera_errors = []
+
+    class FakeEngine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            raise ValueError("Model files are incomplete.")
+
+    class FakeCamera:
+        def __init__(self, *_args):
+            pass
+
+        def open(self):
+            pass
+
+        def read(self):
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr("src.identity.workers.FaceRecognitionEngine", FakeEngine)
+    worker = CameraPreviewWorker(
+        0,
+        640,
+        480,
+        models_directory=tmp_path,
+        camera_factory=FakeCamera,
+    )
+    worker.previewReady.connect(lambda *args: preview_frames.append(args))
+    worker.cameraError.connect(camera_errors.append)
+
+    worker.run()
+
+    assert camera_errors
+    assert "Model files are incomplete." in camera_errors[0]
+    assert not any(
+        guidance is not None and guidance.get("model_ready")
+        for *_args, guidance in preview_frames
+    )
+
+
+def test_camera_monitor_uses_configured_camera_index(tmp_path):
     opened_indexes = []
 
     class FakeRepository:
@@ -296,4 +365,4 @@ def test_camera_monitor_uses_camera_zero_even_if_settings_are_legacy(
 
     worker.run()
 
-    assert opened_indexes == [0]
+    assert opened_indexes == [7]

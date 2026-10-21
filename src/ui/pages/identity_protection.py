@@ -289,13 +289,18 @@ class IdentityProtectionPage(QWidget):
     def _on_camera_state(self, state: str, detail: str) -> None:
         labels = {
             "disabled": "Camera: off · access disabled",
-            "idle": "Camera: access enabled · idle",
+            "idle": "Camera permission enabled · camera idle",
             "connecting": "Camera: connecting",
             "connected": "Camera: connected",
             "unavailable": "Camera: unavailable",
         }
         self.camera_status.setText(labels.get(state, "Camera: status unknown"))
-        self.camera_status.setToolTip(detail)
+        self.camera_status.setToolTip(
+            f"{detail} Camera access permission does not open the camera by itself; "
+            "select Enroll / Re-enroll to start the enrollment camera session."
+            if state == "idle"
+            else detail
+        )
 
     def _on_preview(self, image) -> None:
         self.preview.setPixmap(

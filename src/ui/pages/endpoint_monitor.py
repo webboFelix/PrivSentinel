@@ -1,7 +1,13 @@
-"""Endpoint process monitoring page."""
+"""Live process usage page backed by the local process monitor."""
 
-from src.ui.pages.base import DataPage
+from src.app.dependencies import ApplicationServices
+from src.ui.pages.endpoint_data import EndpointDataPage
 
 
-class EndpointMonitorPage(DataPage):
-    page_key = "process-monitor"
+class EndpointMonitorPage(EndpointDataPage):
+    def __init__(
+        self,
+        services: ApplicationServices,
+        parent=None,
+    ) -> None:
+        super().__init__("process-monitor", services, parent)
