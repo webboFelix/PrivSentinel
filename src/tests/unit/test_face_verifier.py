@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from src.config.settings import AppSettings
+from src.identity.face_detector import FaceDetector
 from src.identity.face_verifier import (
     FaceRecognitionEngine,
     RecognitionModelUnavailable,
@@ -41,6 +42,26 @@ def test_best_similarity_matches_either_saved_pose_template():
         templates,
         np.asarray([0.0, 1.0], dtype=np.float32),
     ) == pytest.approx(1.0)
+
+
+def test_glasses_detector_requires_frame_structure_over_both_eyes():
+    frame = np.full((160, 160, 3), 180, dtype=np.uint8)
+    landmarks = np.asarray(
+        [[50, 65], [110, 65], [80, 90], [60, 115], [100, 115]],
+        dtype=np.float32,
+    )
+    without_glasses = frame.copy()
+    for eye_x in (50, 110):
+        cv2.rectangle(
+            frame,
+            (eye_x - 15, 54),
+            (eye_x + 15, 76),
+            (20, 20, 20),
+            2,
+        )
+
+    assert FaceDetector.glasses_visible(frame, landmarks)
+    assert not FaceDetector.glasses_visible(without_glasses, landmarks)
 
 
 def test_recognition_model_is_installed_requires_core_model_files(tmp_path):

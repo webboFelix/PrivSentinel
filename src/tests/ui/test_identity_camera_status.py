@@ -140,7 +140,7 @@ def test_enrollment_starts_after_explicit_consent_and_start(qtbot, monkeypatch, 
         {"model_ready": True},
     )
     assert dialog._speech_ready
-    assert dialog.step_prompt.text().startswith("Sample 1 of 8")
+    assert dialog.step_prompt.text().startswith("Sample 1 of 7")
     assert dialog.readiness_progress.maximum() == 100
 
     dialog.reject()
@@ -225,6 +225,7 @@ def test_enrollment_preview_uses_fixed_oval_and_blocks_off_center_face(
         "yaw": 0.0,
         "pitch": 0.0,
         "eyes_open": True,
+        "glasses_detected": False,
         "embedding": np.ones(32, dtype=np.float32),
     }
     centered_face = DetectedFace(110, 70, 100, 100)
@@ -251,6 +252,47 @@ def test_enrollment_preview_uses_fixed_oval_and_blocks_off_center_face(
     assert dialog._step_index == 1
     assert dialog.readiness_progress.value() == 0
     assert "center of the oval guide" in dialog.readiness_indicator.text()
+    dialog.reject()
+
+
+def test_centered_front_pose_captures_without_head_pose_estimate_gate(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    dialog._speech_ready = True
+    monkeypatch.setattr(
+        "src.ui.dialogs.enrollment_dialog.winsound.MessageBeep",
+        lambda _tone: None,
+    )
+
+    image = QImage(320, 240, QImage.Format.Format_RGB32)
+    image.fill(0xFFFFFF)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    quality = ImageQuality(True, "Good lighting and focus.", 100.0, 50.0)
+    face = DetectedFace(110, 70, 100, 100)
+    guidance = {
+        "yaw": 19.0,
+        "pitch": 16.0,
+        "eyes_open": True,
+        "embedding": np.ones(32, dtype=np.float32),
+    }
+
+    for _ in range(dialog._STABLE_FRAMES_REQUIRED):
+        dialog._show_preview(image, [face], frame, quality, guidance)
+
+    assert dialog._step_index == 1
+    assert dialog.enrollment_progress_label.text().startswith(
+        "Enrollment progress: 14%"
+    )
+    preview = dialog._preview_source.toImage()
+    assert any(
+        preview.pixelColor(x, y).green() > 200
+        and preview.pixelColor(x, y).red() < 100
+        for x in range(157, 163)
+        for y in range(20, 26)
+    )
     dialog.reject()
 
 
@@ -447,6 +489,7 @@ def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
         "yaw": 0.0,
         "pitch": 0.0,
         "eyes_open": True,
+        "glasses_detected": False,
         "embedding": np.ones(32, dtype=np.float32),
     }
 
@@ -482,17 +525,12 @@ def test_guided_enrollment_auto_captures_and_finishes_after_final_pose(
     assert dialog._step_index == 5
 
     feed(center_guidance)
-    for eyes_open in (True, True, False, True, True, False, True, True):
-        feed({**center_guidance, "eyes_open": eyes_open}, count=1)
-    assert dialog._step_index == 5
-    feed(center_guidance)
     assert dialog._step_index == 6
-    feed(center_guidance)
     feed(center_guidance)
     assert dialog._enrollment_succeeded
     assert enrolled_templates[0].shape == (2, 32)
     assert not np.allclose(enrolled_templates[0][0], enrolled_templates[0][1])
-    assert len(beeps) == 8
+    assert len(beeps) == 7
     assert "Enrollment complete" in dialog.enrollment_summary.text()
     assert "Template storage: Encrypted, local device only" in dialog.enrollment_summary.text()
 
@@ -538,6 +576,7 @@ def test_pose_capture_does_not_wait_for_spoken_prompt(qtbot, monkeypatch, tmp_pa
         "yaw": 0.0,
         "pitch": 0.0,
         "eyes_open": True,
+        "glasses_detected": False,
         "embedding": np.ones(32, dtype=np.float32),
     }
     face = DetectedFace(110, 70, 100, 100)
@@ -546,7 +585,7 @@ def test_pose_capture_does_not_wait_for_spoken_prompt(qtbot, monkeypatch, tmp_pa
 
     assert dialog._step_index == 1
     assert dialog.enrollment_progress_label.text().startswith(
-        "Enrollment progress: 12%"
+        "Enrollment progress: 14%"
     )
     dialog._speech_worker.stop()
     dialog._preview_worker.stop()
@@ -591,11 +630,65 @@ def test_glasses_option_adds_two_front_facing_samples(qtbot, tmp_path):
 
     dialog.glasses_checkbox.setChecked(True)
 
-    assert len(dialog._sample_steps()) == 10
+    assert len(dialog._sample_steps()) == 9
     assert dialog._sample_steps()[5:7] == (
-        ("If you normally wear them, put on your glasses", "center"),
-        ("Now remove your glasses", "center"),
+        ("Put on your glasses; keep both lenses visible", "glasses_on"),
+        ("Remove your glasses for the next sample", "glasses_off"),
     )
+    dialog.reject()
+
+
+def test_glasses_samples_require_visual_glasses_evidence(
+    qtbot, monkeypatch, tmp_path
+):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    dialog = EnrollmentDialog(services, services.identity_repository)
+    qtbot.addWidget(dialog)
+    dialog.glasses_checkbox.setChecked(True)
+    dialog._step_index = 5
+    monkeypatch.setattr(
+        "src.ui.dialogs.enrollment_dialog.winsound.MessageBeep",
+        lambda _tone: None,
+    )
+
+    image = QImage(320, 240, QImage.Format.Format_RGB32)
+    image.fill(0xFFFFFF)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    quality = ImageQuality(True, "Good lighting and focus.", 100.0, 50.0)
+    face = DetectedFace(110, 70, 100, 100)
+    guidance = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "eyes_open": True,
+        "glasses_detected": False,
+        "embedding": np.ones(32, dtype=np.float32),
+    }
+
+    for _ in range(dialog._STABLE_FRAMES_REQUIRED):
+        dialog._show_preview(image, [face], frame, quality, guidance)
+
+    assert dialog._step_index == 5
+    assert "Wear glasses" in dialog.readiness_indicator.text()
+    assert dialog.readiness_progress.value() == 0
+
+    wearing_glasses = {**guidance, "glasses_detected": True}
+    for _ in range(dialog._STABLE_FRAMES_REQUIRED):
+        dialog._show_preview(image, [face], frame, quality, wearing_glasses)
+
+    assert dialog._step_index == 6
+
+    for _ in range(dialog._STABLE_FRAMES_REQUIRED):
+        dialog._show_preview(image, [face], frame, quality, wearing_glasses)
+
+    assert dialog._step_index == 6
+    assert "Remove your glasses" in dialog.readiness_indicator.text()
+
+    without_glasses = {**guidance, "embedding": np.zeros(32, dtype=np.float32)}
+    without_glasses["embedding"][0] = 1.0
+    for _ in range(dialog._STABLE_FRAMES_REQUIRED):
+        dialog._show_preview(image, [face], frame, quality, without_glasses)
+
+    assert dialog._step_index == 7
     dialog.reject()
 
 

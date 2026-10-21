@@ -50,13 +50,12 @@ class EnrollmentDialog(QDialog):
         ("Please turn your head to your right", "right"),
         ("Please look up", "up"),
         ("Please look down", "down"),
-        ("Please blink twice", "blink"),
         ("Please face the camera", "center"),
         ("Hold still for verification", "center"),
     )
     _GLASSES_SAMPLE_STEPS = (
-        ("If you normally wear them, put on your glasses", "center"),
-        ("Now remove your glasses", "center"),
+        ("Put on your glasses; keep both lenses visible", "glasses_on"),
+        ("Remove your glasses for the next sample", "glasses_off"),
     )
     _HIGH_CONSISTENCY_THRESHOLD = 0.85
     _MODERATE_CONSISTENCY_THRESHOLD = 0.70
@@ -100,10 +99,6 @@ class EnrollmentDialog(QDialog):
         self._speech_ready = False
         self._speech_prompt_step_index: int | None = None
         self._stable_frames = 0
-        self._blink_count = 0
-        self._eyes_closed_frames = 0
-        self._eyes_open_frames = 0
-        self._blink_armed = False
 
         dialog_layout = QVBoxLayout(self)
         scroll_area = QScrollArea()
@@ -509,10 +504,6 @@ class EnrollmentDialog(QDialog):
         instruction = self._sample_steps()[self._step_index][0]
         self._speech_ready = False
         self._stable_frames = 0
-        self._blink_count = 0
-        self._eyes_closed_frames = 0
-        self._eyes_open_frames = 0
-        self._blink_armed = False
         self._set_position_progress(0)
         self.readiness_indicator.setText("Listening for the requested position…")
         self._speech_prompt_step_index = self._step_index
@@ -571,6 +562,10 @@ class EnrollmentDialog(QDialog):
         ):
             action = self._sample_steps()[self._step_index][1]
             position_matches = self._pose_matches(action, guidance)
+            position_matches = position_matches and self._glasses_match(
+                action,
+                guidance,
+            )
         face_ready = face_centered and quality.accepted and position_matches
         pixmap = QPixmap.fromImage(image)
         painter = QPainter(pixmap)
@@ -658,6 +653,21 @@ class EnrollmentDialog(QDialog):
             self._set_position_progress(0)
             return
 
+        if not self._glasses_match(
+            self._sample_steps()[self._step_index][1],
+            guidance,
+        ):
+            self._stable_frames = 0
+            action = self._sample_steps()[self._step_index][1]
+            detail = (
+                "Wear glasses with both lenses visible over your eyes."
+                if action == "glasses_on"
+                else "Remove your glasses completely for this sample."
+            )
+            self.readiness_indicator.setText(detail)
+            self._set_position_progress(0)
+            return
+
         self._last_embedding = np.asarray(guidance["embedding"], dtype=np.float32)
         action = self._sample_steps()[self._step_index][1]
         ready, progress, detail = self._evaluate_position(action, guidance)
@@ -724,27 +734,6 @@ class EnrollmentDialog(QDialog):
 
     def _evaluate_position(self, action: str, guidance: dict) -> tuple[bool, int, str]:
         action_matched = self._pose_matches(action, guidance)
-        if action == "blink":
-            if action_matched and guidance["eyes_open"]:
-                if self._blink_armed and self._eyes_closed_frames >= 1:
-                    self._blink_count += 1
-                self._eyes_closed_frames = 0
-                self._eyes_open_frames += 1
-                if self._eyes_open_frames >= 2:
-                    self._blink_armed = True
-            elif action_matched:
-                if self._blink_armed:
-                    self._eyes_closed_frames += 1
-                self._eyes_open_frames = 0
-            else:
-                self._eyes_closed_frames = 0
-                self._eyes_open_frames = 0
-                self._blink_armed = False
-            self._blink_count = min(self._blink_count, 2)
-            percent = self._blink_count * 50
-            if self._blink_count < 2:
-                return False, percent, f"Blink detected: {self._blink_count}/2"
-            action_matched = True
 
         if not action_matched:
             self._stable_frames = 0
@@ -763,11 +752,8 @@ class EnrollmentDialog(QDialog):
     def _pose_matches(self, action: str, guidance: dict) -> bool:
         yaw = float(guidance["yaw"])
         pitch = float(guidance["pitch"])
-        if action in {"center", "blink"}:
-            return (
-                abs(yaw) <= self._POSE_ANGLE_THRESHOLD
-                and abs(pitch) <= self._POSE_ANGLE_THRESHOLD
-            )
+        if action in {"center", "glasses_on", "glasses_off"}:
+            return True
         if action == "left":
             return yaw >= self._POSE_ANGLE_THRESHOLD
         if action == "right":
@@ -777,6 +763,15 @@ class EnrollmentDialog(QDialog):
         if action == "down":
             return pitch >= self._POSE_ANGLE_THRESHOLD
         return False
+
+    @staticmethod
+    def _glasses_match(action: str, guidance: dict) -> bool:
+        glasses_detected = guidance.get("glasses_detected")
+        if action == "glasses_on":
+            return glasses_detected is True
+        if action == "glasses_off":
+            return glasses_detected is False
+        return True
 
     def _complete_step(self) -> None:
         if self._last_embedding is None or self._step_index >= len(self._sample_steps()):

@@ -52,6 +52,70 @@ class FaceDetector:
         ]
 
     @staticmethod
+    def glasses_visible(frame: np.ndarray, landmarks: np.ndarray) -> bool:
+        points = np.asarray(landmarks, dtype=np.float32)
+        if (
+            frame is None
+            or frame.ndim != 3
+            or frame.shape[2] < 3
+            or points.shape != (5, 2)
+            or not np.isfinite(points).all()
+        ):
+            return False
+
+        eye_distance = float(np.linalg.norm(points[1] - points[0]))
+        if eye_distance < 12:
+            return False
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        lens_width = max(12, int(eye_distance * 0.56))
+        lens_height = max(10, int(eye_distance * 0.46))
+        horizontal_length = 0.0
+        vertical_length = 0.0
+
+        for eye_x, eye_y in points[:2]:
+            center_x = round(float(eye_x))
+            center_y = round(float(eye_y))
+            left = center_x - lens_width // 2
+            top = center_y - lens_height // 2
+            right = left + lens_width
+            bottom = top + lens_height
+            if left < 0 or top < 0 or right > gray.shape[1] or bottom > gray.shape[0]:
+                return False
+
+            eye_region = gray[top:bottom, left:right]
+            edges = cv2.Canny(cv2.GaussianBlur(eye_region, (3, 3), 0), 45, 120)
+            lines = cv2.HoughLinesP(
+                edges,
+                rho=1,
+                theta=np.pi / 180,
+                threshold=max(5, lens_width // 5),
+                minLineLength=max(5, lens_width // 5),
+                maxLineGap=max(2, lens_width // 8),
+            )
+            if lines is None:
+                return False
+
+            eye_horizontal = 0.0
+            eye_vertical = 0.0
+            for line in lines[:, 0]:
+                x1, y1, x2, y2 = (int(value) for value in line)
+                dx = abs(x2 - x1)
+                dy = abs(y2 - y1)
+                if dx >= lens_width * 0.18 and dy <= max(2, dx * 0.25):
+                    eye_horizontal += dx
+                elif dy >= lens_height * 0.18 and dx <= max(2, dy * 0.25):
+                    eye_vertical += dy
+            if (
+                eye_horizontal < lens_width * 0.22
+                or eye_vertical < lens_height * 0.22
+            ):
+                return False
+            horizontal_length += eye_horizontal
+            vertical_length += eye_vertical
+
+        return horizontal_length > 0 and vertical_length > 0
+
+    @staticmethod
     def validate_enrollment_frame(
         frame: np.ndarray,
         faces: list[DetectedFace],

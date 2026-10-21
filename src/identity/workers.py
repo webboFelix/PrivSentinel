@@ -132,14 +132,6 @@ class CameraPreviewWorker(QThread):
                 return
             if model_errors:
                 raise model_errors[0]
-            eye_cascade_path = (
-                Path(cv2.data.haarcascades) / "haarcascade_eye_tree_eyeglasses.xml"
-            )
-            eye_cascade = cv2.CascadeClassifier(str(eye_cascade_path))
-            if eye_cascade.empty():
-                raise RuntimeError(
-                    f"Could not load eye detector cascade: {eye_cascade_path}"
-                )
             if preview_frame is not None:
                 self.previewReady.emit(
                     frame_to_image(preview_frame),
@@ -173,30 +165,13 @@ class CameraPreviewWorker(QThread):
                         frame.shape[1],
                         frame.shape[0],
                     )
-                    x, y, width, height = (
-                        faces[0].x,
-                        faces[0].y,
-                        faces[0].width,
-                        faces[0].height,
-                    )
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    eye_region = gray[
-                        max(0, y) : min(gray.shape[0], y + int(height * 0.65)),
-                        max(0, x) : min(gray.shape[1], x + width),
-                    ]
-                    eyes = eye_cascade.detectMultiScale(
-                        eye_region,
-                        scaleFactor=1.1,
-                        minNeighbors=4,
-                        minSize=(max(12, width // 10), max(12, height // 12)),
-                    )
-                    midpoint = eye_region.shape[1] / 2
-                    left_eye = any(eye[0] + eye[2] / 2 < midpoint for eye in eyes)
-                    right_eye = any(eye[0] + eye[2] / 2 >= midpoint for eye in eyes)
                     guidance = {
                         "yaw": pose.yaw_degrees,
                         "pitch": pose.pitch_degrees,
-                        "eyes_open": left_eye and right_eye,
+                        "glasses_detected": FaceDetector.glasses_visible(
+                            frame,
+                            face.landmarks,
+                        ),
                         "embedding": face.embedding,
                     }
                 image = frame_to_image(frame)
