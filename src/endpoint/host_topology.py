@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
 import re
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import psutil
@@ -54,13 +56,27 @@ class HostTopology:
 class HostTopologyCollector:
     """Collect only locally available host facts; no network probes are sent."""
 
+    def __init__(self) -> None:
+        self._attached_device_cache: dict[str, dict[str, object]] = {}
+
     def collect(self) -> HostTopology:
         warnings: list[str] = []
-        addresses = self._local_addresses(warnings)
-        gateways = self._default_gateways(warnings)
-        endpoints = self._active_endpoints(warnings)
-        removable = self._removable_storage(warnings)
-        devices = self._attached_devices(warnings)
+        route_warnings: list[str] = []
+        device_warnings: list[str] = []
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="host-topology") as pool:
+            gateway_task = pool.submit(self._default_gateways, route_warnings)
+            device_task = pool.submit(
+                self._attached_devices,
+                device_warnings,
+                self._attached_device_cache,
+            )
+            addresses = self._local_addresses(warnings)
+            endpoints = self._active_endpoints(warnings)
+            removable = self._removable_storage(warnings)
+            gateways = gateway_task.result()
+            devices = device_task.result()
+        warnings.extend(route_warnings)
+        warnings.extend(device_warnings)
         return HostTopology(
             hostname=socket.gethostname(),
             local_addresses=addresses,
@@ -72,19 +88,63 @@ class HostTopologyCollector:
         )
 
     @staticmethod
-    def _attached_devices(warnings: list[str]) -> tuple[AttachedDevice, ...]:
+    def _attached_devices(
+        warnings: list[str],
+        property_cache: dict[str, dict[str, object]] | None = None,
+    ) -> tuple[AttachedDevice, ...]:
         if os.name != "nt":
             return ()
+        cache_payload = base64.b64encode(
+            json.dumps(
+                [
+                    {"InstanceId": instance_id, **properties}
+                    for instance_id, properties in (property_cache or {}).items()
+                ]
+            ).encode("utf-8")
+        ).decode("ascii")
         command = (
             "$ErrorActionPreference = 'Stop'; "
+            "$cacheJson = [Text.Encoding]::UTF8.GetString("
+            f"[Convert]::FromBase64String('{cache_payload}')); "
+            "$propertyCache = @($cacheJson | ConvertFrom-Json); "
             "$devices = @(Get-PnpDevice -PresentOnly | "
-            "Where-Object { ($_.InstanceId -match '^USB\\\\VID_' -and "
-            "$_.InstanceId -notmatch '&MI_') -or "
-            "$_.Class -in @('Ports', 'Monitor') } | "
-            "Select-Object Class, FriendlyName, InstanceId); "
+            "Where-Object { ($_.Class -eq 'USB' -and "
+            "$_.InstanceId -match '^USB\\\\VID_' -and "
+            "$_.InstanceId -notmatch '&MI_') -or $_.Class -eq 'WPD' -or "
+            "($_.Class -eq 'Ports' -and $_.InstanceId -match '^USB\\\\' -and "
+            "$_.FriendlyName -match '\\(COM\\d+\\)') -or "
+            "$_.Class -eq 'Monitor' } | "
+            "ForEach-Object { "
+            "$device = $_; "
+            "$cached = $propertyCache | Where-Object "
+            "{ $_.InstanceId -eq $device.InstanceId } | Select-Object -First 1; "
+            "$registryKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + "
+            "$device.InstanceId; "
+            "$registry = Get-ItemProperty -LiteralPath $registryKey "
+            "-ErrorAction SilentlyContinue; "
+            "$removable = $null -ne $registry -and "
+            "(($registry.Capabilities -band 4) -ne 0); "
+            "$descriptionQueried = $removable -and "
+            "$device.Class -in @('USB', 'WPD') -and "
+            "$device.FriendlyName -match '^(USB Composite Device|MTP USB Device|USB Device)$'; "
+            "$descriptionValue = if ($cached) { $cached.BusDescription } "
+            "elseif ($descriptionQueried) "
+            "{ (Get-PnpDeviceProperty -InstanceId $device.InstanceId "
+            "-KeyName 'DEVPKEY_Device_BusReportedDeviceDesc' "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1).Data } "
+            "else { $null }; "
+            "$removalValue = if ($removable) { 3 } else { 1 }; "
+            "[pscustomobject]@{ Class = $device.Class; "
+            "FriendlyName = $device.FriendlyName; InstanceId = $device.InstanceId; "
+            "Status = $device.Status; "
+            "Parent = $null; ContainerId = $registry.ContainerID; "
+            "RemovalPolicy = $removalValue; BusDescription = $descriptionValue; "
+            "BusDescriptionQueried = $descriptionQueried "
+            "} } ); "
             "$displays = @(); "
             "try { $displays = @(Get-CimInstance "
             "-Namespace root\\wmi -ClassName WmiMonitorConnectionParams | "
+            "Where-Object { $_.VideoOutputTechnology -ne 11 } | "
             "Select-Object InstanceName, VideoOutputTechnology) } catch { }; "
             "[pscustomobject]@{ devices = $devices; displays = $displays } | "
             "ConvertTo-Json -Compress -Depth 3"
@@ -101,7 +161,7 @@ class HostTopologyCollector:
                 capture_output=True,
                 check=True,
                 encoding="utf-8",
-                timeout=6,
+                timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             inventory = json.loads(result.stdout or "{}")
@@ -111,7 +171,12 @@ class HostTopologyCollector:
             OSError,
             json.JSONDecodeError,
         ) as exc:
-            warnings.append(f"Attached-device inventory unavailable: {exc}")
+            detail = (
+                str(exc.stderr or exc.stdout or exc).strip()
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            warnings.append(f"Attached-device inventory unavailable: {detail}")
             return ()
 
         if not isinstance(inventory, dict):
@@ -136,7 +201,62 @@ class HostTopologyCollector:
         }
         rows = inventory.get("devices", [])
         device_rows = rows if isinstance(rows, list) else [rows]
-        devices: dict[str, AttachedDevice] = {}
+        if property_cache is not None:
+            present_ids = {
+                str(item.get("InstanceId", "")).strip()
+                for item in device_rows
+                if isinstance(item, dict)
+            }
+            for instance_id in set(property_cache) - present_ids:
+                property_cache.pop(instance_id, None)
+            for item in device_rows:
+                if not isinstance(item, dict):
+                    continue
+                instance_id = str(item.get("InstanceId", "")).strip()
+                if instance_id and item.get("BusDescriptionQueried"):
+                    property_cache[instance_id] = {
+                        "BusDescription": item.get("BusDescription"),
+                    }
+        devices: dict[str, tuple[int, AttachedDevice]] = {}
+        serial_ports: dict[str, set[str]] = {}
+        for item in device_rows:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("Class", "")).casefold() != "ports":
+                continue
+            port_match = re.search(
+                r"\((COM\d+)\)",
+                str(item.get("FriendlyName") or ""),
+                re.IGNORECASE,
+            )
+            product_match = re.match(
+                r"^(USB\\VID_[^&\\]+&PID_[^&\\]+)",
+                str(item.get("InstanceId") or ""),
+                re.IGNORECASE,
+            )
+            if port_match and product_match:
+                serial_ports.setdefault(
+                    product_match.group(1).casefold(),
+                    set(),
+                ).add(port_match.group(1).upper())
+        removable_product_counts: dict[str, int] = {}
+        for item in device_rows:
+            if (
+                isinstance(item, dict)
+                and str(item.get("Class", "")).casefold() in {"usb", "wpd"}
+                and item.get("RemovalPolicy") == 3
+                and "&MI_" not in str(item.get("InstanceId") or "").upper()
+            ):
+                product_match = re.match(
+                    r"^(USB\\VID_[^&\\]+&PID_[^&\\]+)",
+                    str(item.get("InstanceId") or ""),
+                    re.IGNORECASE,
+                )
+                if product_match:
+                    product_key = product_match.group(1).casefold()
+                    removable_product_counts[product_key] = (
+                        removable_product_counts.get(product_key, 0) + 1
+                    )
         active_displays = tuple(display_connections)
         for item in device_rows:
             if not isinstance(item, dict):
@@ -146,13 +266,10 @@ class HostTopologyCollector:
                 continue
             device_class = str(item.get("Class", "")).casefold()
             friendly_name = str(item.get("FriendlyName") or "").strip()
-            if device_class == "ports":
-                if not instance_id.upper().startswith("USB\\VID_"):
+            status = str(item.get("Status") or "Unknown")
+            if device_class == "monitor":
+                if "integrated" in friendly_name.casefold():
                     continue
-                kind = "serial"
-                port = re.search(r"\((COM\d+)\)", friendly_name, re.IGNORECASE)
-                label = port.group(1).upper() if port else "Serial port"
-            elif device_class == "monitor":
                 normalized_instance = instance_id.casefold()
                 active_instance = next(
                     (
@@ -167,35 +284,79 @@ class HostTopologyCollector:
                     continue
                 kind = "display"
                 label = display_connections[active_instance] or "Monitor"
-            elif instance_id.upper().startswith("USB\\VID_"):
-                kind = "usb"
-                if not friendly_name:
+                detail = f"Connected · {status}"
+            elif device_class == "wpd":
+                if (
+                    not instance_id.upper().startswith("USB\\VID_")
+                    or item.get("RemovalPolicy") != 3
+                ):
                     continue
-                label = friendly_name
+                kind = "usb"
+                label = str(item.get("BusDescription") or friendly_name).strip()
+                if not label or label.casefold() == "mtp usb device":
+                    label = "USB phone"
+                detail = f"Connected · {status}"
+            elif instance_id.upper().startswith("USB\\VID_"):
+                if (
+                    "&MI_" in instance_id.upper()
+                    or item.get("RemovalPolicy") != 3
+                ):
+                    continue
+                kind = "usb"
+                label = str(item.get("BusDescription") or friendly_name).strip()
+                if not label or label.casefold() == "usb composite device":
+                    label = "USB device"
+                detail = f"Connected · {status}"
+                product_match = re.match(
+                    r"^(USB\\VID_[^&\\]+&PID_[^&\\]+)",
+                    instance_id,
+                    re.IGNORECASE,
+                )
+                if product_match:
+                    product_key = product_match.group(1).casefold()
+                    ports = (
+                        serial_ports.get(product_key, set())
+                        if removable_product_counts.get(product_key) == 1
+                        else set()
+                    )
+                    if ports:
+                        detail += f" · serial {', '.join(sorted(ports))}"
             else:
                 continue
-            physical_id = re.sub(r"&MI_\d+", "", instance_id, flags=re.IGNORECASE)
-            key = physical_id.casefold()
+            container_id = str(item.get("ContainerId") or "").strip("{}").casefold()
+            if not container_id or container_id == "00000000-0000-0000-ffff-ffffffffffff":
+                container_id = re.sub(
+                    r"&MI_\d+",
+                    "",
+                    instance_id,
+                    flags=re.IGNORECASE,
+                ).casefold()
+            key = container_id
             candidate = AttachedDevice(
                 instance_id=instance_id,
                 label=label,
                 kind=kind,
-                detail="Connected",
+                detail=detail,
             )
             current = devices.get(key)
-            if current is None or (kind == "serial" and current.kind != "serial"):
-                devices[key] = candidate
-        return tuple(devices[key] for key in sorted(devices))
+            rank = 2 if device_class == "wpd" else 1
+            if current is None or rank > current[0]:
+                devices[key] = (rank, candidate)
+        return tuple(devices[key][1] for key in sorted(devices))
 
     @staticmethod
     def _local_addresses(warnings: list[str]) -> tuple[str, ...]:
         try:
             interfaces = psutil.net_if_addrs()
+            interface_status = psutil.net_if_stats()
         except OSError as exc:
             warnings.append(f"Local interface addresses unavailable: {exc}")
             return ()
         values: set[str] = set()
-        for interface_addresses in interfaces.values():
+        for interface, interface_addresses in interfaces.items():
+            status = interface_status.get(interface)
+            if status is None or not status.isup:
+                continue
             for item in interface_addresses:
                 if item.family not in (socket.AF_INET, socket.AF_INET6):
                     continue
@@ -204,7 +365,11 @@ class HostTopologyCollector:
                     parsed = ipaddress.ip_address(address)
                 except ValueError:
                     continue
-                if not parsed.is_loopback and not parsed.is_unspecified:
+                if (
+                    not parsed.is_loopback
+                    and not parsed.is_unspecified
+                    and not parsed.is_link_local
+                ):
                     values.add(str(parsed))
         return tuple(sorted(values, key=lambda value: (":" in value, value)))
 
@@ -280,45 +445,47 @@ class HostTopologyCollector:
     def _default_gateways(warnings: list[str]) -> tuple[str, ...]:
         if os.name != "nt":
             return ()
-        import winreg
-
-        gateways: set[str] = set()
-        interface_key_path = (
-            r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
-        )
         try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, interface_key_path) as key:
-                index = 0
-                while True:
-                    try:
-                        interface = winreg.EnumKey(key, index)
-                    except OSError:
-                        break
-                    index += 1
-                    try:
-                        with winreg.OpenKey(key, interface) as interface_key:
-                            for value_name in ("DefaultGateway", "DhcpDefaultGateway"):
-                                try:
-                                    value, _ = winreg.QueryValueEx(
-                                        interface_key, value_name
-                                    )
-                                except FileNotFoundError:
-                                    continue
-                                candidates = (
-                                    value if isinstance(value, (tuple, list)) else (value,)
-                                )
-                                for candidate in candidates:
-                                    try:
-                                        address = ipaddress.ip_address(str(candidate))
-                                    except ValueError:
-                                        continue
-                                    if not address.is_unspecified:
-                                        gateways.add(str(address))
-                    except OSError:
-                        continue
+            result = subprocess.run(
+                ["route.exe", "print", "-4"],
+                capture_output=True,
+                check=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         except OSError as exc:
-            warnings.append(f"Default gateway inventory unavailable: {exc}")
-        return tuple(sorted(gateways))
+            warnings.append(f"Active default route unavailable: {exc}")
+            return ()
+        except subprocess.SubprocessError as exc:
+            warnings.append(f"Active default route unavailable: {exc}")
+            return ()
+
+        active_interfaces = set(HostTopologyCollector._local_addresses(warnings))
+        candidates: list[tuple[int, str]] = []
+        for line in result.stdout.splitlines():
+            if "persistent routes" in line.casefold():
+                break
+            columns = line.split()
+            if len(columns) < 5 or columns[:2] != ["0.0.0.0", "0.0.0.0"]:
+                continue
+            gateway, interface = columns[2:4]
+            try:
+                gateway_address = ipaddress.ip_address(gateway)
+                metric = int(columns[4])
+            except ValueError:
+                continue
+            if (
+                gateway_address.version == 4
+                and not gateway_address.is_unspecified
+                and not gateway_address.is_loopback
+                and interface in active_interfaces
+            ):
+                candidates.append((metric, str(gateway_address)))
+        if not candidates:
+            return ()
+        return (min(candidates)[1],)
 
     @staticmethod
     def _removable_storage(warnings: list[str]) -> tuple[RemovableStorage, ...]:

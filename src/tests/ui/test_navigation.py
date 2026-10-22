@@ -17,7 +17,7 @@ from src.storage.models import IdentityEvent
 from src.ui.components.search_bar import SearchBar
 from src.ui.main_window import MainWindow
 from src.ui.navigation import PAGE_DEFINITIONS
-from src.ui.pages.dashboard import _ratio_percent
+from src.ui.pages.dashboard import DashboardPage, _ratio_percent
 
 
 @pytest.fixture
@@ -279,7 +279,7 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
     assert dashboard.identity_verification_card.state_label.text() == "NOT ENROLLED"
     assert dashboard.identity_verification_card.live_badge.text() == "● OFFLINE"
     assert dashboard.score_summary.ring._score is None
-    assert dashboard.score_summary.risk_label.text() == "NO DATA · ENABLE MONITORS"
+    assert dashboard.score_summary.risk_label.text() == "NO DATA · IDENTITY / FILES"
     assert dashboard.score_summary.factor_progress["Identity"].value() == 0
     assert dashboard.score_summary.factor_values["Identity"].text() == "N/A"
     assert dashboard.threat_summary.count_label.text() == "0"
@@ -321,9 +321,7 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
     assert dashboard.identity_verification_card.last_seen_label.text() == "Last seen  0 seconds ago"
     assert dashboard.identity_verification_card.face_status.text().endswith("Face detected")
     assert dashboard.identity_verification_card.match_status.text().endswith("Identity matched")
-    assert dashboard.identity_verification_card.motion_status.text().endswith(
-        "Motion not confirmed"
-    )
+    assert dashboard.identity_verification_card.motion_status.isHidden()
     assert not dashboard.identity_summary.avatar.pixmap().isNull()
     assert not dashboard.identity_verification_card.avatar.pixmap().isNull()
 
@@ -349,12 +347,10 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
         pending_motion,
         profile_image,
     )
-    assert dashboard.identity_summary.state_label.text() == "MOTION NOT CONFIRMED"
-    assert dashboard.identity_verification_card.state_label.text() == "MOTION NOT CONFIRMED"
-    assert "not proof of spoofing" in dashboard.identity_verification_card.state_label.toolTip()
-    assert dashboard.identity_verification_card.motion_status.text().endswith(
-        "Motion not confirmed"
-    )
+    assert dashboard.identity_summary.state_label.text() == "VERIFIED"
+    assert dashboard.identity_verification_card.name_label.text() == "Local user"
+    assert dashboard.identity_verification_card.state_label.text() == "VERIFIED"
+    assert dashboard.identity_verification_card.motion_status.isHidden()
 
     dashboard.identity_verification_card.history_button.click()
     assert window.current_page_key == "verification-history"
@@ -394,8 +390,8 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
         }
     )
 
-    assert score_card.ring._score is None
-    assert score_card.risk_label.text() == "INCOMPLETE · ENABLE MISSING MONITORS"
+    assert score_card.ring._score == 86
+    assert score_card.risk_label.text() == "HEALTHY · MAINTAIN PROTECTION"
     assert {
         name: progress.value()
         for name, progress in score_card.factor_progress.items()
@@ -429,9 +425,9 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
             "Windows": (40, "1/2 channels", True),
         }
     )
-    assert score_card.ring._score == 64.4
-    assert score_card.risk_label.text() == "FAIR · REVIEW WEAK AREAS"
-    assert score_card.ring._color.name() == "#f5ad32"
+    assert score_card.ring._score == 86
+    assert score_card.risk_label.text() == "HEALTHY · MAINTAIN PROTECTION"
+    assert score_card.ring._color.name() == "#18d89b"
     assert {
         name: label.text() for name, label in score_card.factor_values.items()
     } == {
@@ -771,7 +767,7 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(
     page = window._pages["file-integrity"]
     watched = tmp_path / "watched"
     watched.mkdir()
-    tracked_file = watched / "tracked.txt"
+    tracked_file = (watched / "tracked.txt").resolve()
     tracked_file.write_text("baseline", encoding="utf-8")
     page.roots.setPlainText(str(watched))
 
@@ -801,6 +797,21 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(
     window.navigate_to("settings")
     settings = window._pages["settings"]
     assert settings.file_integrity_roots.toPlainText() == str(watched)
+
+
+def test_file_integrity_page_surfaces_baseline_creation_failure(
+    qtbot, window, tmp_path
+):
+    page = window._pages["file-integrity"]
+    missing = tmp_path / "missing-baseline-root"
+    page.roots.setPlainText(str(missing))
+
+    page.start_baseline()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
+
+    assert page.status.text_label.text().startswith("Baseline failed:")
+    assert "root is unavailable" in page.status.text_label.text()
+    assert page.baseline_button.isEnabled()
 
 
 def test_settings_create_baseline_button_starts_baseline(qtbot, window, tmp_path):
@@ -866,11 +877,18 @@ def test_empty_directory_baseline_is_shown_as_current(window, tmp_path):
     assert "baseline needs refresh" not in page.status.text_label.text()
 
 
-def test_dashboard_activity_columns_are_visible_and_aligned(qtbot, window):
-    dashboard = window._pages["dashboard"]
-    window.services.settings = replace(
-        window.services.settings, process_monitoring_enabled=True
+def test_dashboard_activity_columns_are_visible_and_aligned(
+    qtbot, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        DashboardPage,
+        "refresh_host_topology",
+        lambda _page: None,
     )
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    window = MainWindow(services)
+    qtbot.addWidget(window)
+    dashboard = window._pages["dashboard"]
     window.services.event_pipeline.publish(
         SecurityEvent(
             source="network",
@@ -895,6 +913,9 @@ def test_dashboard_activity_columns_are_visible_and_aligned(qtbot, window):
         )
     )
     dashboard.refresh_security_data()
+    dashboard.process_activity.set_processes(
+        (ProcessSnapshot(321, "example.exe", 12.5, 44 * 1024 * 1024, "local-user"),)
+    )
     window.show()
     qtbot.wait(30)
 
@@ -922,6 +943,7 @@ def test_dashboard_activity_columns_are_visible_and_aligned(qtbot, window):
         dashboard.network_activity.table.horizontalHeaderItem(index).text()
         for index in range(5)
     ] == ["Source", "Destination", "Port", "Protocol", "Risk"]
+    window.close()
     assert [
         dashboard.process_activity.table.horizontalHeaderItem(index).text()
         for index in range(5)
@@ -962,6 +984,8 @@ def test_dashboard_keeps_reference_column_composition_when_window_resizes(qtbot,
     for index, card in enumerate(dashboard.metric_cards):
         row, column, row_span, column_span = grid.getItemPosition(grid.indexOf(card))
         assert (row, column, row_span, column_span) == (0, index * 4, 1, 4)
+
+    assert [grid.rowStretch(row) for row in (1, 2, 3)] == [5, 3, 2]
 
     for width in (1040, 1440):
         window.resize(width, 700)

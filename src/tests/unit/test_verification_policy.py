@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from src.config.settings import AppSettings
+from src.identity.liveness import BasicMotionLiveness
 from src.identity.verification_policy import VerificationPolicy
 from src.identity.workers import CameraMonitorWorker
 
@@ -209,3 +210,88 @@ def test_still_face_remains_pending_instead_of_becoming_liveness_failure(
     assert "liveness_failure" not in states
     assert repository.events[0]["state"] == "low_confidence"
     assert "not evidence of spoofing" in repository.events[0]["detail"]
+
+
+def test_basic_motion_verification_stays_passed_after_motion_is_observed():
+    liveness = BasicMotionLiveness(required_samples=3, minimum_motion=0.02)
+    landmarks = np.zeros((5, 2), dtype=np.float32)
+
+    assert liveness.update(landmarks, 100, 100) == "awaiting_basic_motion"
+    assert liveness.update(landmarks + 2, 100, 100) == "awaiting_basic_motion"
+    assert liveness.update(landmarks + 5, 100, 100) == "basic_motion_observed"
+    assert liveness.update(landmarks + 5, 100, 100) == "basic_motion_observed"
+
+    liveness.reset()
+
+    assert liveness.result == "awaiting_basic_motion"
+
+
+def test_matched_and_unmatched_faces_raise_tailgating_warning(tmp_path):
+    class FakeCapture:
+        def open(self):
+            return None
+
+        def read(self):
+            return np.zeros((10, 10, 3), dtype=np.uint8)
+
+        def release(self):
+            return None
+
+    class FakeEngine:
+        def load(self):
+            return None
+
+        def analyze(self, _frame):
+            return [
+                SimpleNamespace(
+                    bounding_box=(0, 0, 5, 5),
+                    landmarks=np.zeros((5, 2), dtype=np.float32),
+                    embedding=np.array([1.0], dtype=np.float32),
+                ),
+                SimpleNamespace(
+                    bounding_box=(5, 5, 10, 10),
+                    landmarks=np.zeros((5, 2), dtype=np.float32),
+                    embedding=np.array([0.0], dtype=np.float32),
+                ),
+            ]
+
+        def best_similarity(self, _templates, embedding):
+            return float(embedding[0])
+
+    class FakeRepository:
+        def __init__(self):
+            self.events = []
+
+        def profile(self):
+            return SimpleNamespace(model_name="test")
+
+        def templates(self):
+            return (object(),)
+
+        def record_event(self, **event):
+            self.events.append(event)
+            return object()
+
+    repository = FakeRepository()
+    worker = CameraMonitorWorker(
+        AppSettings(capture_interval_ms=0, verification_threshold=0.8),
+        tmp_path,
+        repository,
+        camera_factory=lambda *_args: FakeCapture(),
+        engine_factory=lambda *_args, **_kwargs: FakeEngine(),
+    )
+    states = []
+
+    def stop_after_warning(state, _detail):
+        states.append(state)
+        if state == "multiple_faces":
+            worker.stop()
+
+    worker.stateChanged.connect(stop_after_warning)
+
+    worker.run()
+
+    assert "multiple_faces" in states
+    assert repository.events[0]["state"] == "multiple_faces"
+    assert "Possible tailgating" in repository.events[0]["detail"]
+    assert "secure the workstation" in repository.events[0]["detail"]

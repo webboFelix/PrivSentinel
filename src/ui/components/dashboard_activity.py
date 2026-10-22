@@ -113,7 +113,7 @@ class DashboardNetworkPanel(_ActivityPanel):
         self.blocked_count = self._summary_value(summary, 3, "Blocked", "0")
         body.addLayout(summary)
         self.table = self.create_table(("Source", "Destination", "Port", "Protocol", "Risk"))
-        self._configure_columns((82, 90, 40, 50, 48))
+        self._configure_columns((78, 86, 36, 42, 42))
         body.addWidget(self.table, 1)
         self.layout().addLayout(body, 1)
         self.empty_label.setText("No local connection events recorded.")

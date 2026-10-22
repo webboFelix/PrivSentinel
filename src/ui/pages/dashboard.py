@@ -1,12 +1,14 @@
 """Service-backed, privacy-first security dashboard."""
 
 import json
+import logging
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 import psutil
-from PySide6.QtCore import QEvent, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QFrame,
@@ -20,9 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
-from src.endpoint.host_topology import HostTopologyCollector
+from src.endpoint.host_topology import HostTopology, HostTopologyCollector
 from src.endpoint.process_monitor import ProcessMonitor
-from src.network.connection_monitor import ConnectionMonitor
 from src.ui.components.dashboard_activity import (
     DashboardLiveFeed,
     DashboardNetworkPanel,
@@ -41,6 +42,8 @@ from src.ui.components.status_indicator import StatusIndicator
 from src.ui.components.threat_landscape import ThreatLandscapeWidget
 from src.ui.icon_assets import icon_path
 
+_LOGGER = logging.getLogger(__name__)
+
 
 def _ratio_percent(numerator: int, denominator: int) -> int | None:
     if denominator <= 0:
@@ -49,20 +52,33 @@ def _ratio_percent(numerator: int, denominator: int) -> int | None:
 
 
 class _TopologyRefreshWorker(QThread):
-    snapshotReady = Signal(object)
+    snapshotReady = Signal(object, object, object)
     failed = Signal(str)
 
-    def __init__(self, collector: HostTopologyCollector, parent: QWidget) -> None:
+    def __init__(
+        self,
+        collector: HostTopologyCollector,
+        parent: QWidget,
+        active_alert: Mapping[str, object] | None,
+        potential_finding: Mapping[str, object] | None,
+    ) -> None:
         super().__init__(parent)
         self.collector = collector
+        self.active_alert = active_alert
+        self.potential_finding = potential_finding
 
     def run(self) -> None:
         try:
             snapshot = self.collector.collect()
-        except (OSError, ValueError, RuntimeError) as exc:
+        except Exception as exc:
+            _LOGGER.exception("Could not collect local host topology")
             self.failed.emit(str(exc))
             return
-        self.snapshotReady.emit(snapshot)
+        self.snapshotReady.emit(
+            snapshot,
+            self.active_alert,
+            self.potential_finding,
+        )
 
 
 class DashboardPage(QWidget):
@@ -137,7 +153,7 @@ class DashboardPage(QWidget):
         outer.addLayout(header)
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
+        grid.setHorizontalSpacing(5)
         grid.setVerticalSpacing(8)
         for column in range(16):
             grid.setColumnStretch(column, 1)
@@ -182,14 +198,14 @@ class DashboardPage(QWidget):
         self.feed = DashboardLiveFeed()
         self.feed.viewAllRequested.connect(lambda: self.pageRequested.emit("alerts"))
         self.network_card = self._status_card(
-            "Network Activity",
+            "Network",
             "Connection metadata collection is disabled.",
             "Open Network Monitor",
             "network-monitor",
             "network-nodes.png",
         )
         self.process_card = self._status_card(
-            "Process Monitor",
+            "Process",
             "Process collection is disabled.",
             "Open Process Monitor",
             "process-monitor",
@@ -222,29 +238,40 @@ class DashboardPage(QWidget):
         self.process_activity.setMinimumHeight(100)
         self.collector_status = QFrame()
         self.collector_status.setObjectName("panel")
-        self.collector_status.setMinimumHeight(90)
-        collector_layout = QGridLayout(self.collector_status)
-        collector_layout.setContentsMargins(5, 5, 5, 5)
-        collector_layout.setSpacing(4)
-        for index, card in enumerate(
-            (self.network_card, self.process_card, self.windows_card, self.camera_card)
+        self.collector_status.setMinimumHeight(88)
+        collector_layout = QHBoxLayout(self.collector_status)
+        collector_layout.setContentsMargins(3, 3, 3, 3)
+        collector_layout.setSpacing(5)
+        for card in (
+            self.network_card,
+            self.process_card,
+            self.windows_card,
+            self.camera_card,
         ):
-            collector_layout.addWidget(card, index, 0)
+            card.setMinimumWidth(0)
+            card.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+            collector_layout.addWidget(card, 1)
 
         grid.addWidget(self.alert_chart, 1, 0, 1, 8)
         grid.addWidget(self.threat_chart, 1, 8, 1, 8)
         grid.addWidget(self.identity_verification_card, 2, 0, 1, 4)
         grid.addWidget(self.integrity_chart, 2, 4, 1, 4)
         grid.addWidget(self.feed, 2, 8, 1, 8)
-        grid.addWidget(self.network_activity, 3, 0, 1, 8)
-        grid.addWidget(self.process_activity, 3, 8, 1, 5)
-        grid.addWidget(self.collector_status, 3, 13, 1, 3)
-        grid.setRowStretch(1, 3)
+        grid.addWidget(self.network_activity, 3, 0, 1, 6)
+        grid.addWidget(self.process_activity, 3, 6, 1, 5)
+        grid.addWidget(self.collector_status, 3, 11, 1, 5)
+        grid.setRowStretch(1, 5)
         grid.setRowStretch(2, 3)
-        grid.setRowStretch(3, 1)
+        grid.setRowStretch(3, 2)
         self._dashboard_grid = grid
         self._desktop_placements = tuple(
-            (grid.itemAt(index).widget(), *grid.getItemPosition(index))
+            (
+                grid.itemAt(index).widget(),
+                *grid.getItemPosition(index),
+            )
             for index in range(grid.count())
             if grid.itemAt(index).widget() is not None
         )
@@ -255,6 +282,17 @@ class DashboardPage(QWidget):
         self._compact_layout = False
         self._responsive_layout_active = False
         outer.addLayout(grid, 1)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(4, 2, 4, 0)
+        footer.addWidget(QLabel("PrivSentinel  ·  Protecting your identity, data and system"))
+        footer.addStretch(1)
+        updated_dot = QLabel("●")
+        updated_dot.setStyleSheet("color:#18d89b;")
+        footer.addWidget(updated_dot)
+        self.last_updated_label = QLabel("Last updated · waiting for local data")
+        self.last_updated_label.setObjectName("muted")
+        footer.addWidget(self.last_updated_label)
+        outer.addLayout(footer)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(15_000)
         self._refresh_timer.timeout.connect(self.refresh_security_data)
@@ -308,9 +346,9 @@ class DashboardPage(QWidget):
         else:
             for widget, row, column, row_span, column_span in self._desktop_placements:
                 grid.addWidget(widget, row, column, row_span, column_span)
-            grid.setRowStretch(1, 3)
+            grid.setRowStretch(1, 5)
             grid.setRowStretch(2, 3)
-            grid.setRowStretch(3, 1)
+            grid.setRowStretch(3, 2)
         self._compact_layout = compact
 
     def refresh_security_data(self) -> None:
@@ -451,22 +489,6 @@ class DashboardPage(QWidget):
             baseline_files, len(alerted_file_paths) + file_alerts_without_path
         )
         clean_baseline_files = max(0, baseline_files - file_alerted_count)
-        process_details_count = sum(
-            process.executable is not None for process in process_snapshot or ()
-        )
-
-        network_counts: tuple[int, int] | None = None
-        network_detail = "Network collection is disabled"
-        if self.services.settings.network_monitoring_enabled:
-            try:
-                network_counts = ConnectionMonitor.inventory_counts()
-                network_detail = (
-                    f"{network_counts[1]:,} attributed / {network_counts[0]:,} "
-                    "remote connections"
-                )
-            except PermissionError as exc:
-                network_detail = str(exc)
-
         windows_worker = self.services.endpoint_service.workers.get(
             "windows-event-log"
         )
@@ -502,23 +524,6 @@ class DashboardPage(QWidget):
             else None
         )
         identity_score = _ratio_percent(identity_passes, identity_attempts)
-        process_score = (
-            _ratio_percent(process_details_count, process_count)
-            if process_worker_running and process_count > 0
-            else None
-        )
-        network_score = (
-            _ratio_percent(network_counts[1], network_counts[0])
-            if network_worker_running and network_counts is not None
-            else None
-        )
-        windows_score = (
-            _ratio_percent(len(windows_read_channels), len(windows_channels))
-            if windows_worker_running
-            and windows_channels
-            and windows_read_channels
-            else None
-        )
         self.score_summary.set_factors(
             {
                 "Identity": (
@@ -536,21 +541,17 @@ class DashboardPage(QWidget):
                     else "No matching baseline",
                 ),
                 "Processes": (
-                    process_score,
+                    None,
                     process_statistic,
                     process_worker_running,
                 ),
                 "Network": (
-                    network_score,
-                    (
-                        f"{network_counts[1]:,}/{network_counts[0]:,} remote"
-                        if network_counts is not None
-                        else "not measured"
-                    ),
+                    None,
+                    "Connection monitoring",
                     network_worker_running,
                 ),
                 "Windows": (
-                    windows_score,
+                    None,
                     windows_statistic,
                     windows_worker_running,
                 ),
@@ -565,18 +566,9 @@ class DashboardPage(QWidget):
                 "Baseline paths without an active file-integrity alert divided by "
                 "the current configured baseline size. This is not a malware scan."
             ),
-            "Processes": (
-                "Visible processes with an executable path divided by all OS process "
-                "IDs. Configured exclusions and inaccessible processes lower coverage."
-            ),
-            "Network": (
-                "Live remote connections attributed to a process divided by all live "
-                "remote connections. No remote connections means no percentage."
-            ),
-            "Windows": (
-                "Windows event-log channels successfully read in the last collection "
-                "cycle divided by the configured local channels."
-            ),
+            "Processes": "Collector status only; this does not affect the score.",
+            "Network": "Collector status only; this does not affect the score.",
+            "Windows": "Collector status only; this does not affect the score.",
         }.items():
             details = {
                 "Identity": (
@@ -587,7 +579,7 @@ class DashboardPage(QWidget):
                     f"{baseline_files:,} baseline paths"
                 ),
                 "Processes": process_statistic,
-                "Network": network_detail,
+                "Network": "Collector status only",
                 "Windows": windows_statistic,
             }[name]
             detail_tooltip = f"{tooltip}\nCurrent sample: {details}"
@@ -637,10 +629,10 @@ class DashboardPage(QWidget):
         else:
             self.process_activity.set_processes(process_snapshot[:4])
         self._set_collector_summary(
-            "Network Activity", self.services.settings.network_monitoring_enabled
+            "Network", self.services.settings.network_monitoring_enabled
         )
         self._set_collector_summary(
-            "Process Monitor", self.services.settings.process_monitoring_enabled
+            "Process", self.services.settings.process_monitoring_enabled
         )
         self._set_collector_summary(
             "Windows Logs", self.services.settings.windows_log_collection_enabled
@@ -648,6 +640,9 @@ class DashboardPage(QWidget):
         self.set_camera_state(
             self.services.identity_service.camera_state,
             self.services.identity_service.camera_detail,
+        )
+        self.last_updated_label.setText(
+            f"Last updated · {datetime.now().astimezone().strftime('%b %d, %Y %H:%M:%S')}"
         )
 
     def refresh_host_topology(self) -> None:
@@ -670,34 +665,56 @@ class DashboardPage(QWidget):
                 error=True,
             )
             return
-        worker = _TopologyRefreshWorker(self._topology_collector, self)
+        worker = _TopologyRefreshWorker(
+            self._topology_collector,
+            self,
+            dict(alerts[0]) if alerts else None,
+            finding,
+        )
         self._topology_worker = worker
-        worker.snapshotReady.connect(
-            lambda topology, active_alert=alerts[0] if alerts else None, current_finding=finding:
-            self.threat_chart.set_snapshot(
-                topology,
-                active_alert,
-                current_finding,
-            )
-        )
-        worker.failed.connect(
-            lambda message: self.threat_chart.set_status(
-                f"Could not refresh local host topology: {message}",
-                error=True,
-            )
-        )
-        worker.finished.connect(lambda worker=worker: self._topology_finished(worker))
+        worker.snapshotReady.connect(self._on_topology_snapshot)
+        worker.failed.connect(self._on_topology_failed)
+        worker.finished.connect(self._on_topology_worker_finished)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _topology_finished(self, worker: _TopologyRefreshWorker) -> None:
-        if self._topology_worker is worker:
+    @Slot(object, object, object)
+    def _on_topology_snapshot(
+        self,
+        topology: HostTopology,
+        active_alert: Mapping[str, object] | None,
+        finding: Mapping[str, object] | None,
+    ) -> None:
+        self.threat_chart.set_snapshot(topology, active_alert, finding)
+
+    @Slot(str)
+    def _on_topology_failed(self, message: str) -> None:
+        self.threat_chart.set_snapshot(
+            HostTopology(
+                hostname="",
+                local_addresses=(),
+                gateways=(),
+                endpoints=(),
+                removable_storage=(),
+                warnings=(),
+            ),
+            None,
+            None,
+        )
+        self.threat_chart.set_status(
+            f"Could not refresh local host topology: {message}",
+            error=True,
+        )
+
+    @Slot()
+    def _on_topology_worker_finished(self) -> None:
+        if self.sender() is self._topology_worker:
             self._topology_worker = None
-        worker.deleteLater()
 
     def stop_workers(self) -> None:
         worker = self._topology_worker
-        if worker is not None and worker.isRunning():
-            worker.wait(7000)
+        if worker is not None:
+            worker.wait()
         self._topology_worker = None
 
     def refresh_integrity_activity(self) -> None:
@@ -789,20 +806,24 @@ class DashboardPage(QWidget):
 
     def set_camera_state(self, state: str, detail: str) -> None:
         descriptions = {
-            "disabled": "Camera access is disabled in Settings.",
-            "idle": "Camera access enabled · no active camera session.",
-            "connecting": "Opening camera…",
-            "connected": "Camera connected and ready.",
-            "unavailable": "Camera unavailable; no attack is inferred.",
+            "disabled": ("Disabled", False),
+            "idle": ("Ready · not streaming", False),
+            "connecting": ("Connecting…", False),
+            "connected": ("Active · Streaming", True),
+            "unavailable": ("Unavailable", False),
         }
         body = self.camera_card.findChild(QLabel, "cardBody")
-        body.setText(descriptions.get(state, "Camera status unknown."))
+        text, active = descriptions.get(state, ("Status unavailable", False))
+        body.setText(text)
+        body.setStyleSheet(
+            "color: #18d89b;" if active else "color: #8ea9c8;"
+        )
         body.setToolTip(detail)
 
     def _set_collector_summary(self, title: str, enabled: bool) -> None:
         sources = {
-            "Network Activity": "network",
-            "Process Monitor": "process",
+            "Network": "network",
+            "Process": "process",
             "Windows Logs": "windows-event-log",
             "Camera": "camera",
         }
@@ -826,11 +847,14 @@ class DashboardPage(QWidget):
         worker = self.services.endpoint_service.workers.get(sources[title])
         running = worker is not None and worker.isRunning()
         body.setText(
-            "Collection is active"
+            "Active · Collecting"
             if running
-            else "Enabled in settings · not running"
+            else "Enabled · Not running"
             if enabled
-            else "Collection is disabled."
+            else "Disabled"
+        )
+        body.setStyleSheet(
+            "color: #18d89b;" if running else "color: #8ea9c8;"
         )
 
     def _status_card(
@@ -842,27 +866,39 @@ class DashboardPage(QWidget):
         icon: str,
     ) -> QFrame:
         card = QFrame()
-        card.setObjectName("panel")
+        card.setObjectName("collectorStatusCard")
         card.setProperty("cardTitle", title)
+        card.setMinimumHeight(62)
+        card.setMinimumWidth(0)
+        card.setStyleSheet(
+            "QFrame#collectorStatusCard { background-color: #071a31; "
+            "border: 1px solid #16466a; border-radius: 9px; }"
+        )
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setContentsMargins(6, 5, 5, 5)
+        layout.setSpacing(5)
         icon_label = QLabel()
-        icon_label.setPixmap(QIcon(icon_path(icon)).pixmap(16, 16))
+        icon_label.setPixmap(QIcon(icon_path(icon)).pixmap(17, 17))
         layout.addWidget(icon_label, 0)
         text_layout = QVBoxLayout()
+        text_layout.setSpacing(2)
         heading = QLabel(title)
         heading.setObjectName("sectionTitle")
         heading.setStyleSheet("font-size: 8pt;")
+        heading.setMinimumWidth(0)
         body = QLabel(message)
         body.setObjectName("cardBody")
         body.setProperty("class", "muted")
+        body.setStyleSheet("color: #8ea9c8; font-size: 7pt;")
+        body.setMinimumWidth(0)
         body.setWordWrap(True)
+        body.setMaximumHeight(28)
         text_layout.addWidget(heading)
         text_layout.addWidget(body)
         layout.addLayout(text_layout, 1)
         button = QPushButton("›")
-        button.setFixedWidth(20)
-        button.setFixedHeight(24)
+        button.setFixedSize(14, 20)
+        button.setStyleSheet("padding: 0; font-size: 10pt;")
         button.setToolTip(action)
         button.clicked.connect(lambda: self.pageRequested.emit(page_key))
         layout.addWidget(button)

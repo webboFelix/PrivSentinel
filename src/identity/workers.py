@@ -366,9 +366,30 @@ class CameraMonitorWorker(QThread):
                     faces = observations
                     if len(faces) > 1:
                         state = "multiple_faces"
+                        similarities = [
+                            engine.best_similarity(templates, face.embedding)
+                            for face in faces
+                        ]
+                        matched = sum(
+                            score >= self.settings.verification_threshold
+                            for score in similarities
+                        )
+                        if 0 < matched < len(faces):
+                            detail = (
+                                "Possible tailgating: one face matched the enrolled "
+                                "identity while another did not. Verification is paused; "
+                                "confirm that only authorized people are present and "
+                                "secure the workstation."
+                            )
+                        else:
+                            detail = (
+                                "Multiple faces detected; verification is paused. "
+                                "Ensure only the enrolled person is in view before "
+                                "continuing."
+                            )
                         self._handle_state(
                             "multiple_faces",
-                            "Multiple faces detected; verification paused.",
+                            detail,
                             None,
                             "not_checked",
                         )

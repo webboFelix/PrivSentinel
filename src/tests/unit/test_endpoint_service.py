@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 
 import pytest
@@ -61,7 +62,9 @@ def test_file_move_with_unique_matching_hash_is_reported_as_inferred_rename(tmp_
     events = FileIntegrityMonitor(services.database, roots).scan()
 
     assert [event.event_type for event in events] == ["file_renamed"]
-    assert events[0].attributes["previous_path"] == str(original)
+    assert os.path.normcase(events[0].attributes["previous_path"]) == os.path.normcase(
+        str(original)
+    )
     assert "path changed" in events[0].description
 
 

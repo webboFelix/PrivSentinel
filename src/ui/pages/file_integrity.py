@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from dataclasses import replace
@@ -23,6 +24,8 @@ from src.app.dependencies import ApplicationServices
 from src.ui.components.data_table import DataTable
 from src.ui.components.status_indicator import StatusIndicator
 from src.ui.icon_assets import icon_path
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _BaselineWorker(QThread):
@@ -51,6 +54,12 @@ class _BaselineWorker(QThread):
             )
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.baselineFailed.emit(str(exc))
+            return
+        except Exception as exc:
+            _LOGGER.exception("Unexpected error while creating file-integrity baseline")
+            self.baselineFailed.emit(
+                f"Unexpected {type(exc).__name__}: {exc}"
+            )
             return
         self.baselineCreated.emit(count)
 

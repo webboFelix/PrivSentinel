@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.endpoint.host_topology import ActiveEndpoint, HostTopology
+from src.endpoint.host_topology import HostTopology
 from src.ui.icon_assets import icon_path
 
 
@@ -33,7 +33,6 @@ class _TopologyNode:
     kind: str
     address: str = ""
     detail: str = ""
-    connection: ActiveEndpoint | None = None
 
 
 class _TopologyCanvas(QWidget):
@@ -48,9 +47,6 @@ class _TopologyCanvas(QWidget):
         self._node_positions: dict[str, QPointF] = {}
         self._node_pixmaps = {
             "computer": QIcon(icon_path("security_appliance.png")).pixmap(32, 32),
-            "internet": QIcon(icon_path("network_globe.png")).pixmap(32, 32),
-            "router": QIcon(icon_path("router.png")).pixmap(32, 32),
-            "endpoint": QIcon(icon_path("security_appliance.png")).pixmap(26, 26),
             "usb": QIcon(icon_path("usb_drive.png")).pixmap(26, 26),
             "serial": QIcon(icon_path("network-nodes.png")).pixmap(26, 26),
             "display": QIcon(icon_path("security_appliance.png")).pixmap(26, 26),
@@ -125,18 +121,11 @@ class _TopologyCanvas(QWidget):
         return slots
 
     def _edges(self) -> tuple[tuple[str, str], ...]:
-        available = set(self._node_positions)
-        edges: list[tuple[str, str]] = []
-        router = next(
-            (node.key for node in self.nodes if node.kind == "router"),
-            None,
+        return tuple(
+            ("computer", node.key)
+            for node in self.nodes
+            if node.key != "computer"
         )
-        if router and "computer" in available:
-            edges.append((router, "computer"))
-        for node in self.nodes:
-            if node.key in available and node.kind not in {"computer", "router"}:
-                edges.append((router or "computer", node.key))
-        return tuple(edges)
 
     def _advance_animation(self) -> None:
         self._phase = (self._phase + 0.012) % 1.0
@@ -157,7 +146,7 @@ class _TopologyCanvas(QWidget):
         position: QPointF,
     ) -> None:
 
-        size = 32 if node.kind in {"computer", "router", "internet"} else 26
+        size = 32 if node.kind == "computer" else 26
         painter.setPen(QPen(QColor("#77d9ff"), 2 if node.key == self.selected_key else 1))
         painter.setBrush(QColor("#0a2c4c"))
         painter.drawEllipse(position, size / 2 + 5, size / 2 + 5)
@@ -299,7 +288,9 @@ class ThreatLandscapeWidget(QFrame):
         self.threat_title.setWordWrap(True)
         detail_layout.addWidget(self.threat_title)
         self.node_selector = QComboBox()
-        self.node_selector.setToolTip("Select a connected host, endpoint, or device")
+        self.node_selector.setToolTip(
+            "Select this device or one of its connected physical devices"
+        )
         # Prevent long IPv6 endpoints from forcing a wider dashboard.
         self.node_selector.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -313,7 +304,7 @@ class ThreatLandscapeWidget(QFrame):
         self.values: dict[str, QLabel] = {}
         self._field_rows: dict[str, tuple[QLabel, QLabel]] = {}
         for row, name in enumerate(
-            ("Process", "Source", "Remote IP", "Risk Score", "Details")
+            ("Process", "Source", "IP address", "Connection", "Details")
         ):
             label = QLabel(name)
             label.setObjectName("muted")
@@ -374,12 +365,11 @@ class ThreatLandscapeWidget(QFrame):
         selected_index = self.node_selector.findData(self._selected_key)
         self.node_selector.setCurrentIndex(max(0, selected_index))
         self.node_selector.blockSignals(False)
-        local_peer_count = sum(node.kind == "endpoint" for node in self._nodes)
         device_count = sum(
             node.kind in {"usb", "serial", "display"} for node in self._nodes
         )
         suffix = "; ".join(topology.warnings)
-        summary = f"{device_count} connected device(s) · {local_peer_count} local peer(s)"
+        summary = f"This device · {device_count} connected device(s)"
         if suffix:
             summary += " · Inventory partial"
         self.topology_status.setText(summary)
@@ -423,32 +413,29 @@ class ThreatLandscapeWidget(QFrame):
             process = str(
                 attributes.get("process_name")
                 or attributes.get("process")
-                or (node.connection.process_name if node.connection else "—")
+                or "—"
             )
             source = str(alert.get("source") or "Alert")
-            risk = alert.get("risk_score")
-            risk_text = f"{float(risk):.0f}/100" if risk is not None else "Not measured"
-            remote_ip = str(
+            connection_text = str(
+                alert.get("risk_score") and f"Risk {float(alert['risk_score']):.0f}/100"
+                or "—"
+            )
+            ip_address = str(
                 attributes.get("remote_address")
                 or attributes.get("remote_ip")
                 or attributes.get("destination_ip")
-                or (node.address if node.kind == "endpoint" else "—")
+                or node.address
+                or "—"
             )
-            if remote_ip != "—" and not _is_ipv4(remote_ip):
-                remote_ip = "—"
             details = str(alert.get("rationale") or node.detail or "—")
             self.severity_badge.setText(severity)
         elif finding is not None:
             title = f"Potential {finding.get('provider', 'malware')} match"
             severity = "REVIEW"
-            process = node.connection.process_name if node.connection else "—"
+            process = "—"
             source = f"{finding.get('provider', 'Scanner')}: {finding.get('rule', 'match')}"
-            risk_text = "Not scored"
-            remote_ip = (
-                node.address
-                if node.kind == "endpoint" and _is_ipv4(node.address)
-                else "—"
-            )
+            connection_text = node.detail or "Not scored"
+            ip_address = node.address or "—"
             details = (
                 f"{finding.get('path', 'Unknown file')} · SHA-256 "
                 f"{finding.get('sha256', 'unavailable')} · review required; "
@@ -458,31 +445,36 @@ class ThreatLandscapeWidget(QFrame):
         else:
             title = node.label
             severity = "NO VERDICT"
-            process = node.connection.process_name if node.connection else "—"
+            process = "—"
             source = node.kind.replace("-", " ").title()
-            risk_text = "Not evaluated"
-            remote_ip = (
-                node.address
-                if node.kind in {"endpoint", "router", "internet"}
+            connection_text = (
+                node.detail
+                if node.detail and (node.kind != "computer" or node.address)
                 else "—"
             )
-            if remote_ip != "—" and not _is_ipv4(remote_ip):
-                remote_ip = "—"
-            details = node.detail or "—"
+            if node.address:
+                ip_address = node.address
+            elif node.kind == "usb":
+                ip_address = "No IP assigned over USB"
+            elif node.kind in {"serial", "display"}:
+                ip_address = "No network IP assigned"
+            else:
+                ip_address = "—"
+            details = node.detail if node.kind != "computer" else "—"
             self.severity_badge.setText("NO ALERT")
         self.threat_title.setText(title)
         self.details.setToolTip(title)
         self.values["Process"].setText(process)
         self.values["Source"].setText(source)
-        self.values["Remote IP"].setText(remote_ip)
-        self.values["Risk Score"].setText(risk_text)
+        self.values["IP address"].setText(ip_address)
+        self.values["Connection"].setText(connection_text)
         self.values["Details"].setText(details[:180])
         visible_values = {
             "Process": process,
             "Source": source,
-            "Remote IP": remote_ip,
-            "Risk Score": risk_text,
-            "Details": details,
+            "IP address": ip_address,
+            "Connection": connection_text,
+            "Details": details if details != connection_text else "",
         }
         for name, (label_widget, value_widget) in self._field_rows.items():
             visible = visible_values[name] not in {
@@ -496,11 +488,16 @@ class ThreatLandscapeWidget(QFrame):
         can_quarantine = finding is not None and str(finding.get("id", "")).isdigit()
         self.quarantine_button.setVisible(can_quarantine)
         self.quarantine_button.setEnabled(can_quarantine)
+        is_remote_endpoint = node.kind == "endpoint" or (
+            alert is not None
+            and any(
+                attributes.get(key)
+                for key in ("remote_address", "remote_ip", "destination_ip")
+            )
+        )
         selected_ip = (
-            remote_ip
-            if remote_ip != "—"
-            else node.address
-            if node.kind == "endpoint"
+            ip_address
+            if is_remote_endpoint and ip_address != "—" and _is_ip_address(ip_address)
             else ""
         )
         self._block_address = selected_ip if _is_blockable_address(selected_ip) else ""
@@ -540,65 +537,16 @@ class ThreatLandscapeWidget(QFrame):
 
 
 def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
-    local_address = _primary_ipv4(topology.local_addresses)
+    address_summary = ", ".join(topology.local_addresses)
     nodes = [
         _TopologyNode(
             "computer",
             "This device",
             "computer",
-            address=local_address or "IP unavailable",
-            detail="This device",
+            address=address_summary,
+            detail="Local interfaces",
         ),
     ]
-    gateway = next(
-        (address for address in topology.gateways if _is_ipv4(address)),
-        None,
-    )
-    if gateway:
-        nodes.append(
-            _TopologyNode(
-                f"router:{gateway}",
-                "Gateway",
-                "router",
-                address=gateway,
-                detail="Connected default gateway",
-            )
-        )
-    unique_endpoints: dict[str, ActiveEndpoint] = {}
-    for endpoint in topology.endpoints:
-        if not _is_ipv4(endpoint.remote_address):
-            continue
-        unique_endpoints.setdefault(endpoint.remote_address, endpoint)
-    public_addresses = sorted(
-        address
-        for address in unique_endpoints
-        if ipaddress.ip_address(address).is_global
-    )
-    local_peers = sorted(
-        address
-        for address in unique_endpoints
-        if _is_lan_ipv4(address)
-    )
-    if public_addresses:
-        nodes.append(
-            _TopologyNode(
-                "internet",
-                "Internet",
-                "internet",
-                detail=f"{len(public_addresses):,} active public peer(s)",
-            )
-        )
-    nodes.extend(
-        _TopologyNode(
-            f"endpoint:{address}",
-            "Connected device",
-            "endpoint",
-            address=address,
-            detail="Private IP observed in a current local connection",
-            connection=unique_endpoints[address],
-        )
-        for address in local_peers[:2]
-    )
     nodes.extend(
         _TopologyNode(
             f"device:{device.instance_id}",
@@ -606,7 +554,7 @@ def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
             device.kind,
             detail=device.detail,
         )
-        for device in topology.attached_devices[:3]
+        for device in topology.attached_devices
     )
     if topology.removable_storage and not any(
         device.kind == "usb" for device in topology.attached_devices
@@ -624,8 +572,6 @@ def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
 
 
 def _device_display_label(label: str, kind: str) -> str:
-    if kind == "serial":
-        return label if label.casefold().startswith("com") else "USB serial"
     normalized = label.casefold()
     if kind == "display":
         if "displayport" in normalized:
@@ -635,11 +581,21 @@ def _device_display_label(label: str, kind: str) -> str:
         if "hdmi" in normalized:
             return "HDMI"
         return "Display"
-    if "android" in normalized:
-        return "Android"
+    if "mouse" in normalized or "pointing" in normalized:
+        return label
+    if any(phone in normalized for phone in ("android", "nokia", "phone", "mtp")):
+        return label
     if "storage" in normalized or "drive" in normalized:
         return "USB storage"
     return "USB device"
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_blockable_address(value: str) -> bool:
@@ -648,47 +604,3 @@ def _is_blockable_address(value: str) -> bool:
     except ValueError:
         return False
     return not address.is_loopback and not address.is_unspecified
-
-
-def _is_ipv4(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).version == 4
-    except ValueError:
-        return False
-
-
-def _is_lan_ipv4(value: str) -> bool:
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    networks = (
-        ipaddress.ip_network("10.0.0.0/8"),
-        ipaddress.ip_network("172.16.0.0/12"),
-        ipaddress.ip_network("192.168.0.0/16"),
-    )
-    return address.version == 4 and any(address in network for network in networks)
-
-
-def _primary_ipv4(addresses: tuple[str, ...]) -> str:
-    networks = (
-        ipaddress.ip_network("192.168.0.0/16"),
-        ipaddress.ip_network("10.0.0.0/8"),
-        ipaddress.ip_network("172.16.0.0/12"),
-    )
-    for network in networks:
-        for value in addresses:
-            try:
-                address = ipaddress.ip_address(value)
-            except ValueError:
-                continue
-            if address.version == 4 and address in network:
-                return str(address)
-    for value in addresses:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError:
-            continue
-        if address.version == 4 and not address.is_loopback and not address.is_unspecified:
-            return str(address)
-    return "IPv4 unavailable"

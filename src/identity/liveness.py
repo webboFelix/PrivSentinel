@@ -41,7 +41,9 @@ class BasicMotionLiveness:
             displacement = np.linalg.norm(
                 self._landmarks[-1] - self._landmarks[0], axis=1
             )
-            self._passed = float(np.median(displacement)) >= self._minimum_motion
+            self._passed = self._passed or (
+                float(np.median(displacement)) >= self._minimum_motion
+            )
         return self.result
 
     def reset(self) -> None:

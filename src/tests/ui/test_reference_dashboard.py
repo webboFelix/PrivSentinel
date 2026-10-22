@@ -88,10 +88,10 @@ def test_threat_landscape_displays_real_alert_and_emits_guarded_actions(qtbot):
     assert "198.51.100.17" not in widget.node_selector.currentText()
     assert widget._node_by_key["computer"].label == "This device"
     assert widget._node_by_key["computer"].address == "192.168.1.20"
-    assert "endpoint:198.51.100.17" not in widget._node_by_key
+    assert set(widget._node_by_key) == {"computer"}
     assert widget.values["Process"].text() == "browser.exe"
-    assert widget.values["Remote IP"].text() == endpoint.remote_address
-    assert widget.values["Risk Score"].text() == "76/100"
+    assert widget.values["IP address"].text() == endpoint.remote_address
+    assert widget.values["Connection"].text() == "Risk 76/100"
     assert widget.block_button.isEnabled()
     with qtbot.waitSignal(widget.blockIpRequested) as signal:
         widget.block_button.click()
@@ -111,7 +111,7 @@ def test_threat_landscape_displays_real_alert_and_emits_guarded_actions(qtbot):
     assert signal.args == [42]
 
 
-def test_topology_hides_hostname_ipv6_and_external_endpoint_lists(qtbot):
+def test_topology_exposes_host_and_peer_addresses_only_in_selected_details(qtbot):
     widget = ThreatLandscapeWidget()
     qtbot.addWidget(widget)
     local_endpoint = ActiveEndpoint(
@@ -161,24 +161,24 @@ def test_topology_hides_hostname_ipv6_and_external_endpoint_lists(qtbot):
     initial_phase = widget.canvas._phase
     qtbot.wait(70)
 
-    assert widget._node_by_key["computer"].address == "192.168.1.20"
-    assert "endpoint:192.168.1.41" in widget._node_by_key
-    assert "endpoint:8.8.8.8" not in widget._node_by_key
-    assert all(
-        ":" not in node.address
-        for node in widget._nodes
-        if node.address and node.address != "IPv4 unavailable"
+    assert widget._node_by_key["computer"].address == (
+        "169.254.10.20, 192.168.1.20, fe80::abcd"
     )
-    assert "OffSecShujaa" not in widget.topology_status.text()
+    assert "fe80::abcd" in widget._node_by_key["computer"].address
+    assert widget.topology_status.text() == "This device · 0 connected device(s)"
     assert "fe80" not in widget.topology_status.text()
     assert all(
-        "fe80" not in widget.node_selector.itemText(index)
+        widget.node_selector.itemText(index) == "This device"
         for index in range(widget.node_selector.count())
+    )
+    assert widget.node_selector.count() == 1
+    assert widget.values["IP address"].text() == (
+        "169.254.10.20, 192.168.1.20, fe80::abcd"
     )
     assert widget.canvas._phase != initial_phase
 
 
-def test_topology_shows_only_connected_nodes_and_limits_preview_clutter(qtbot):
+def test_topology_shows_all_current_peers_and_connected_devices(qtbot):
     widget = ThreatLandscapeWidget()
     qtbot.addWidget(widget)
     peers = tuple(
@@ -219,14 +219,51 @@ def test_topology_shows_only_connected_nodes_and_limits_preview_clutter(qtbot):
     assert "firewall" not in widget._node_by_key
     assert "router:unknown" not in widget._node_by_key
     assert "internet" not in widget._node_by_key
-    assert sum(node.kind == "endpoint" for node in widget._nodes) == 2
-    assert sum(node.kind == "usb" for node in widget._nodes) == 3
-    assert "endpoint-overflow" not in widget._node_by_key
-    assert "device:overflow" not in widget._node_by_key
-    assert all("DEVICE" not in widget.node_selector.itemText(i) for i in range(widget.node_selector.count()))
+    assert sum(node.kind == "endpoint" for node in widget._nodes) == 0
+    assert sum(node.kind == "usb" for node in widget._nodes) == 5
+    assert len(widget._nodes) == 6
+    assert widget.node_selector.count() == 6
+    assert all(
+        "DEVICE" not in widget.node_selector.itemText(i)
+        for i in range(widget.node_selector.count())
+    )
+    assert widget.topology_status.text() == "This device · 5 connected device(s)"
     assert widget.quarantine_button.isHidden()
     assert widget.block_button.isHidden()
     assert widget.view_details_button.isHidden()
+
+
+def test_selected_usb_device_explicitly_reports_no_network_ip(qtbot):
+    widget = ThreatLandscapeWidget()
+    qtbot.addWidget(widget)
+    device = AttachedDevice(
+        instance_id="USB\\VID_1782&PID_4EE7\\PHONE",
+        label="Nokia C30",
+        kind="usb",
+        detail="Connected · Error",
+    )
+    widget.set_snapshot(
+        HostTopology(
+            hostname="workstation",
+            local_addresses=("192.168.1.20",),
+            gateways=(),
+            endpoints=(),
+            removable_storage=(),
+            warnings=(),
+            attached_devices=(device,),
+        ),
+        None,
+        None,
+    )
+
+    widget.node_selector.setCurrentIndex(
+        widget.node_selector.findData("device:USB\\VID_1782&PID_4EE7\\PHONE")
+    )
+
+    assert widget.threat_title.text() == "Nokia C30"
+    assert widget.values["IP address"].text() == "No IP assigned over USB"
+    assert widget.values["Connection"].text() == "Connected · Error"
+    assert widget.block_button.isHidden()
 
 
 def test_topology_details_hide_empty_fields_and_unavailable_actions(qtbot):
@@ -244,10 +281,10 @@ def test_topology_details_hide_empty_fields_and_unavailable_actions(qtbot):
     widget.set_snapshot(topology, None, None)
 
     assert widget._field_rows["Process"][0].isHidden()
-    assert widget._field_rows["Remote IP"][0].isHidden()
-    assert widget._field_rows["Risk Score"][0].isHidden()
+    assert widget._field_rows["IP address"][0].isHidden()
     assert not widget._field_rows["Source"][0].isHidden()
-    assert not widget._field_rows["Details"][0].isHidden()
+    assert widget._field_rows["Connection"][0].isHidden()
+    assert widget._field_rows["Details"][0].isHidden()
     assert widget.quarantine_button.isHidden()
     assert widget.block_button.isHidden()
     assert widget.view_details_button.isHidden()
@@ -259,13 +296,24 @@ def test_security_health_score_uses_level_colors_and_action_messages(qtbot):
 
     def set_score(value: int) -> None:
         card.set_factors(
-            {name: (value, "measured") for name in card._FACTORS}
+            {
+                "Identity": (value, "measured"),
+                "Files": (value, "measured"),
+                "Processes": (None, "Active", True),
+                "Network": (None, "Active", True),
+                "Windows": (None, "Active", True),
+            }
         )
 
     set_score(90)
     assert card.ring._score == 90
     assert card.ring._color.name() == "#18d89b"
     assert card.risk_label.text() == "HEALTHY · MAINTAIN PROTECTION"
+
+    set_score(70)
+    assert card.ring._score == 70
+    assert card.ring._color.name() == "#f5ad32"
+    assert card.risk_label.text() == "FAIR · REVIEW WEAK AREAS"
 
     set_score(40)
     assert card.ring._score == 40

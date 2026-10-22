@@ -114,6 +114,35 @@ def _set_avatar(
     label.setText("")
 
 
+class _FramedAvatar(QLabel):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(70, 70)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            "color:#e6f0ff;background:#071a31;border:1px solid #087d78;"
+            "border-radius:8px;font-size:14pt;font-weight:600;"
+        )
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#18d89b"), 2.2, Qt.PenStyle.SolidLine))
+        corner = 12
+        inset = 2
+        left, top = inset, inset
+        right, bottom = self.width() - inset - 1, self.height() - inset - 1
+        painter.drawLine(left, top + corner, left, top)
+        painter.drawLine(left, top, left + corner, top)
+        painter.drawLine(right - corner, top, right, top)
+        painter.drawLine(right, top, right, top + corner)
+        painter.drawLine(left, bottom - corner, left, bottom)
+        painter.drawLine(left, bottom, left + corner, bottom)
+        painter.drawLine(right - corner, bottom, right, bottom)
+        painter.drawLine(right, bottom - corner, right, bottom)
+
+
 class DashboardIdentityCard(_SummaryCard):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("Identity Protection", "identity-verified.png", parent)
@@ -132,6 +161,9 @@ class DashboardIdentityCard(_SummaryCard):
             "border-radius:31px;font-size:15pt;font-weight:600;"
         )
         self._avatar_key: tuple[str, str] | None = None
+        self._verified_identity: str | None = None
+        self._verified_confidence: float | None = None
+        self._verified_at: datetime | None = None
         self.body_layout.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         details = QVBoxLayout()
@@ -141,7 +173,6 @@ class DashboardIdentityCard(_SummaryCard):
         self.name_label = QLabel("Consent-based enrollment required")
         self.name_label.setObjectName("muted")
         self.name_label.setWordWrap(True)
-        self.name_label.hide()
         confidence_row = QHBoxLayout()
         confidence_row.setSpacing(4)
         self.confidence_label = QLabel("Confidence")
@@ -195,8 +226,12 @@ class DashboardIdentityCard(_SummaryCard):
             self.state_label.setText("NOT ENROLLED")
             self.state_label.setStyleSheet("color:#8ea9c8;font-weight:700;")
             self.name_label.setText("Consent-based enrollment required")
+            self.name_label.show()
             self.confidence_value_label.setText("—")
             self.last_verified_value_label.setText("—")
+            self._verified_identity = None
+            self._verified_confidence = None
+            self._verified_at = None
             return
 
         avatar_key = (profile_image, display_name)
@@ -205,7 +240,7 @@ class DashboardIdentityCard(_SummaryCard):
             self._avatar_key = avatar_key
         self.avatar.setToolTip(display_name)
         self.name_label.setText(display_name)
-        self.name_label.hide()
+        self.name_label.show()
         current = (
             last_event.state
             if last_event is not None
@@ -219,34 +254,44 @@ class DashboardIdentityCard(_SummaryCard):
                 or last_event.liveness == "awaiting_basic_motion"
             )
         )
+        if self._verified_identity != display_name:
+            self._verified_identity = display_name
+            self._verified_confidence = None
+            self._verified_at = None
+        if verified:
+            self._verified_confidence = (
+                last_event.confidence if last_event is not None else None
+            )
+            self._verified_at = (
+                last_event.occurred_at if last_event is not None else datetime.now(UTC)
+            )
+        elif motion_pending and self._verified_at is not None:
+            verified = True
         shown_state = (
             "VERIFIED"
             if verified
-            else "MOTION NOT CONFIRMED"
-            if motion_pending
             else current or "ENROLLED"
         )
         self.state_label.setText(shown_state)
-        self.state_label.setToolTip(
-            "Basic facial movement was not observed in this short sample. "
-            "Move slightly to continue; this is not proof of spoofing."
-            if motion_pending
-            else shown_state
-        )
+        self.state_label.setToolTip(shown_state)
         self.state_label.setStyleSheet(
             "color:#18d89b;font-weight:700;"
             if verified
             else "color:#f5ad32;font-weight:700;"
         )
-        confidence = last_event.confidence if last_event is not None else None
+        confidence = (
+            self._verified_confidence
+            if motion_pending and self._verified_at is not None
+            else last_event.confidence if last_event is not None else None
+        )
         self.confidence_value_label.setText(
             f"{confidence:.1%}" if confidence is not None else "—"
         )
-        if last_event is not None and last_event.state == "recognized":
+        if verified and self._verified_at is not None:
             self.last_verified_value_label.setText(
-                _time_ago(last_event.occurred_at)
+                _time_ago(self._verified_at)
             )
-        else:
+        elif not (motion_pending and self._verified_at is not None):
             self.last_verified_value_label.setText("—")
 
 
@@ -283,14 +328,12 @@ class IdentityVerificationCard(QFrame):
 
         content = QHBoxLayout()
         content.setSpacing(8)
-        self.avatar = QLabel("—")
-        self.avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.avatar.setFixedSize(52, 52)
-        self.avatar.setStyleSheet(
-            "color:#e6f0ff;background:#0a2b4d;border:1px solid #05d6a2;"
-            "border-radius:5px;font-size:14pt;font-weight:600;"
-        )
+        self.avatar = _FramedAvatar()
+        self.avatar.setText("—")
         self._avatar_key: tuple[str, str] | None = None
+        self._verified_identity: str | None = None
+        self._verified_confidence: float | None = None
+        self._verified_at: datetime | None = None
         content.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         details = QVBoxLayout()
@@ -349,17 +392,22 @@ class IdentityVerificationCard(QFrame):
             self._set_status(self.face_status, "Face not detected", False)
             self._set_status(self.match_status, "Identity not verified", False)
             self._set_status(self.motion_status, "Liveness not confirmed", False)
+            self.motion_status.hide()
             self.live_badge.setText("● OFFLINE")
             self.live_badge.setStyleSheet(
                 "color:#88a3c1;background:#102b49;border:1px solid #244c70;"
                 "border-radius:8px;padding:2px 7px;font-size:8pt;font-weight:700;"
             )
+            self._verified_identity = None
+            self._verified_confidence = None
+            self._verified_at = None
             return
 
         avatar_key = (profile_image, display_name)
         if avatar_key != self._avatar_key:
-            _set_avatar(self.avatar, profile_image, display_name, 52, circular=False)
+            _set_avatar(self.avatar, profile_image, display_name, 58, circular=False)
             self._avatar_key = avatar_key
+        self.name_label.setText(display_name)
         self.name_label.setToolTip(display_name)
 
         state_value = state.casefold()
@@ -373,31 +421,44 @@ class IdentityVerificationCard(QFrame):
                 or last_event.liveness == "awaiting_basic_motion"
             )
         )
+        if self._verified_identity != display_name:
+            self._verified_identity = display_name
+            self._verified_confidence = None
+            self._verified_at = None
+        if verified:
+            self._verified_confidence = (
+                last_event.confidence if last_event is not None else None
+            )
+            self._verified_at = (
+                last_event.occurred_at if last_event is not None else datetime.now(UTC)
+            )
+        elif motion_pending and self._verified_at is not None:
+            verified = True
         label = (
             "VERIFIED"
             if verified
-            else "MOTION NOT CONFIRMED"
+            else "ENROLLED"
             if motion_pending
             else state_value.replace("_", " ").upper()
         )
         if not label or label == "STOPPED":
             label = "ENROLLED"
         self.state_label.setText(label)
-        self.state_label.setToolTip(
-            "Basic facial movement was not observed in this short sample. "
-            "Move slightly to continue; this is not proof of spoofing."
-            if motion_pending
-            else label
-        )
+        self.state_label.setToolTip(label)
         confidence = last_event.confidence if last_event is not None else None
+        if motion_pending and self._verified_at is not None:
+            confidence = self._verified_confidence
         self.confidence_label.setText(
             f"{confidence:.1%}"
             if confidence is not None
             else "—"
         )
+        last_seen = self._verified_at if motion_pending and verified else (
+            last_event.occurred_at if last_event is not None and verified else None
+        )
         self.last_seen_label.setText(
-            f"Last seen  {_time_ago(last_event.occurred_at)}"
-            if last_event is not None and verified
+            f"Last seen  {_time_ago(last_seen)}"
+            if last_seen is not None
             else "Last seen  —"
         )
 
@@ -415,9 +476,10 @@ class IdentityVerificationCard(QFrame):
         )
         self._set_status(
             self.motion_status,
-            "Liveness confirmed" if motion_observed else "Motion not confirmed",
+            "Liveness confirmed",
             motion_observed,
         )
+        self.motion_status.setVisible(motion_observed)
         self.live_badge.setText("● LIVE" if monitoring else "● IDLE")
         self.live_badge.setStyleSheet(
             "color:#05d6a2;background:#073d42;border:1px solid #087d78;"
@@ -442,7 +504,7 @@ class IdentityVerificationCard(QFrame):
 class _ScoreRing(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(78, 78)
+        self.setFixedSize(88, 88)
         self._score: float | None = None
         self._color = QColor("#f5ad32")
 
@@ -454,19 +516,34 @@ class _ScoreRing(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#17395c"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(7, 7, 64, 64, 0, 360 * 16)
+        painter.setPen(
+            QPen(
+                QColor("#17395c"),
+                7,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+            )
+        )
+        painter.drawArc(8, 8, 72, 72, 0, 360 * 16)
         if self._score is not None:
             painter.setPen(
                 QPen(
                     self._color,
-                    6,
+                    7,
                     Qt.PenStyle.SolidLine,
                     Qt.PenCapStyle.RoundCap,
                 )
             )
-            painter.drawArc(7, 7, 64, 64, 90 * 16, -int(360 * 16 * self._score / 100))
+            painter.drawArc(
+                8,
+                8,
+                72,
+                72,
+                90 * 16,
+                -int(360 * 16 * self._score / 100),
+            )
         painter.setPen(QColor("#e6f0ff"))
+        painter.setFont(self.font())
         painter.drawText(
             self.rect().adjusted(0, -2, 0, -2),
             Qt.AlignmentFlag.AlignCenter,
@@ -476,6 +553,7 @@ class _ScoreRing(QWidget):
 
 class DashboardScoreCard(_SummaryCard):
     _FACTORS = ("Identity", "Files", "Processes", "Network", "Windows")
+    _SCORE_FACTORS = frozenset(("Identity", "Files"))
     _FACTOR_COLORS = ("#05d6b5", "#9fce3b", "#f7a526", "#f29b20", "#ee941d")
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -550,10 +628,11 @@ class DashboardScoreCard(_SummaryCard):
                 if len(factor) == 3
                 else None
             )
-            if score is not None:
+            is_score_factor = name in self._SCORE_FACTORS
+            if is_score_factor and score is not None:
                 score = min(100, max(0, score))
                 coverage_scores.append(score)
-            else:
+            elif is_score_factor:
                 missing_factors.append(name)
             self.factor_stats[name].setText(statistic)
             self.factor_stats[name].setToolTip(statistic)
@@ -590,37 +669,42 @@ class DashboardScoreCard(_SummaryCard):
                 )
                 self.factor_indicators[name].setToolTip(status_text)
             self.factor_progress[name].setValue(score or 0)
-        if len(coverage_scores) == len(self._FACTORS):
+        if coverage_scores:
             average = sum(coverage_scores) / len(coverage_scores)
-            if average >= 80:
-                color = "#18d89b"
-                status = "HEALTHY · MAINTAIN PROTECTION"
-            elif average >= 60:
-                color = "#f5ad32"
-                status = "FAIR · REVIEW WEAK AREAS"
-            else:
-                color = "#f04b67"
-                status = "AT RISK · TAKE ACTION"
+            color, status = self._score_style(average)
+            if len(coverage_scores) != len(self._SCORE_FACTORS):
+                status = (
+                    f"PARTIAL · {len(coverage_scores)}/"
+                    f"{len(self._SCORE_FACTORS)} MEASURED"
+                )
             self.ring.set_score(average, color)
             self.risk_label.setText(status)
             self.risk_label.setStyleSheet(f"color:{color};font-weight:700;")
         else:
             self.ring.set_score(None, "#f5ad32")
             self.risk_label.setText(
-                "INCOMPLETE · ENABLE MISSING MONITORS"
+                "INCOMPLETE · IDENTITY / FILE DATA NEEDED"
                 if coverage_scores
-                else "NO DATA · ENABLE MONITORS"
+                else "NO DATA · IDENTITY / FILES"
             )
             self.risk_label.setStyleSheet("color:#f5ad32;font-weight:700;")
         tooltip = (
-            "The equal-weight average is shown only after all five Identity, Files, "
-            "Processes, Network, and Windows measurements have real sample denominators. "
-            "A partial dataset is not presented as a complete score. This is an "
-            "operational indicator, not a malware or protection-effectiveness score."
+            "The ring averages only identity verification and file-integrity health. "
+            "A partial score is labeled with its measured-factor count; unavailable "
+            "measurements are not treated as zero. Process, network, and Windows "
+            "collector states are shown separately and do not affect the score."
         )
         if missing_factors:
             tooltip += "\nUnavailable measurements: " + ", ".join(missing_factors)
         self.risk_label.setToolTip(tooltip)
+
+    @staticmethod
+    def _score_style(score: float) -> tuple[str, str]:
+        if score >= 80:
+            return "#18d89b", "HEALTHY · MAINTAIN PROTECTION"
+        if score >= 60:
+            return "#f5ad32", "FAIR · REVIEW WEAK AREAS"
+        return "#f04b67", "AT RISK · TAKE ACTION"
 
 
 class _ThreatSparkline(QWidget):
