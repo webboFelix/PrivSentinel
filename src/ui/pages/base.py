@@ -392,6 +392,19 @@ class DataPage(QWidget):
             f"Rule rationale: {alert['rationale']}\n\n"
             f"Event: {alert['description']}",
         )
+        if alert["status"] == "open":
+            try:
+                self.services.security_repository.transition_alert(
+                    alert_id,
+                    "acknowledged",
+                )
+            except (KeyError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                self.source_status.set_text(
+                    f"Alert reviewed but could not be acknowledged: {exc}"
+                )
+                self.source_status.set_state("error")
+                return
+            self._refresh()
 
     def _create_investigation_for_selected_alert(self) -> None:
         if self.services is None:

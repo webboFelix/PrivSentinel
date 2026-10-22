@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -56,20 +57,36 @@ class TopBar(QFrame):
         self.notification_button.setToolTip("Open alerts")
         self.notification_button.setAccessibleName("Open alerts")
         self.notification_button.clicked.connect(self.notificationsRequested)
-        layout.addWidget(self.notification_button)
+        notification_holder = QWidget()
+        notification_holder.setFixedSize(42, 38)
+        notification_layout = QGridLayout(notification_holder)
+        notification_layout.setContentsMargins(0, 0, 0, 0)
+        notification_layout.addWidget(
+            self.notification_button,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignCenter,
+        )
         self.alert_count = QLabel()
         self.alert_count.setObjectName("alertCountBadge")
         self.alert_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.alert_count.setMinimumWidth(18)
+        self.alert_count.setFixedHeight(18)
         self.alert_count.setStyleSheet(
             "color: white; background: #b4233b; border-radius: 9px; "
             "font-size: 8pt; font-weight: 700; padding: 1px 5px;"
         )
         self.alert_count.hide()
-        layout.addWidget(self.alert_count)
+        notification_layout.addWidget(
+            self.alert_count,
+            0,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        )
+        layout.addWidget(notification_holder)
 
     def set_alert_count(self, count: int) -> None:
-        self.alert_count.setText(str(count) if count < 100 else "99+")
+        self.alert_count.setText(str(count))
         self.alert_count.setVisible(count > 0)
         description = f"Open alerts ({count})" if count else "Open alerts"
         self.notification_button.setToolTip(description)

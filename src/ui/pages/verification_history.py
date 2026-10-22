@@ -89,9 +89,9 @@ class VerificationHistoryPage(QWidget):
         rows = [
             (
                 event.occurred_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-                event.state.replace("_", " ").title(),
+                _verification_result_label(event.state, event.liveness),
                 f"{event.confidence:.1%}" if event.confidence is not None else "—",
-                event.liveness.replace("_", " ").title(),
+                _liveness_result_label(event.state, event.liveness),
                 f"{event.monitoring_seconds:.0f}s",
                 event.detail,
             )
@@ -134,3 +134,17 @@ class VerificationHistoryPage(QWidget):
             f"Removed {removed} event(s) older than the configured retention period.",
         )
         self._refresh()
+
+
+def _verification_result_label(state: str, liveness: str) -> str:
+    if state == "liveness_failure" or liveness == "awaiting_basic_motion":
+        return "Motion not confirmed"
+    return state.replace("_", " ").title()
+
+
+def _liveness_result_label(state: str, liveness: str) -> str:
+    if state == "liveness_failure" or liveness == "awaiting_basic_motion":
+        return "Motion not confirmed"
+    if liveness == "basic_motion_observed":
+        return "Basic motion observed"
+    return liveness.replace("_", " ").title()

@@ -110,7 +110,7 @@ def test_global_search_includes_local_events_and_files(qtbot, monkeypatch, windo
     assert any("FILE" in record[0] and "needle.txt" in record[0] for record in captured["records"])
 
 
-def test_topbar_and_sidebar_show_active_alert_count(window):
+def test_topbar_and_sidebar_show_unreviewed_alert_count(window, monkeypatch):
     with window.services.database.transaction() as connection:
         for index, status in enumerate(("open", "investigating", "resolved")):
             event_id = f"event-{index}"
@@ -158,11 +158,34 @@ def test_topbar_and_sidebar_show_active_alert_count(window):
         )
     )
 
-    assert window.topbar.alert_count.text() == "2"
+    assert window.topbar.alert_count.text() == "1"
     assert not window.topbar.alert_count.isHidden()
     for badge in window.sidebar._alert_badges.values():
-        assert badge.text() == "2"
+        assert badge.text() == "1"
         assert not badge.isHidden()
+
+    window.topbar.set_alert_count(123)
+    window.sidebar.set_alert_count(123)
+    assert window.topbar.alert_count.text() == "123"
+    assert all(badge.text() == "123" for badge in window.sidebar._alert_badges.values())
+    window._update_alert_count()
+
+    alerts_page = window._pages["alerts"]
+    alerts_page._refresh()
+    assert alerts_page.table.select_id("alert-0")
+    monkeypatch.setattr(
+        "src.ui.pages.base.QMessageBox.information",
+        lambda *args: None,
+    )
+    alerts_page._show_alert_details()
+
+    assert window.topbar.alert_count.isHidden()
+    assert all(badge.isHidden() for badge in window.sidebar._alert_badges.values())
+    assert next(
+        alert
+        for alert in window.services.security_repository.list_alerts(limit=10)
+        if alert["id"] == "alert-0"
+    )["status"] == "acknowledged"
 
 
 def test_lock_warning_cannot_be_cancelled_and_closes_when_identity_is_verified(window):
@@ -171,6 +194,7 @@ def test_lock_warning_cannot_be_cancelled_and_closes_when_identity_is_verified(w
     window.services.settings = replace(
         window.services.settings,
         automatic_lock_enabled=True,
+        unknown_face_action="lock_after_grace",
     )
 
     window._warn_before_lock(30)
@@ -186,6 +210,29 @@ def test_lock_warning_cannot_be_cancelled_and_closes_when_identity_is_verified(w
     assert warning.isVisible()
 
     window._on_identity_state_changed("recognized", "Enrolled identity recognized.")
+
+    assert window._lock_warning_box is None
+    assert not window._lock_timer.isActive()
+    assert not warning.isVisible()
+
+
+def test_no_face_warning_uses_grace_period_and_camera_failure_dismisses(window):
+    window.show()
+    window.services.settings = replace(
+        window.services.settings,
+        automatic_lock_enabled=True,
+        presence_loss_action="lock_after_grace",
+    )
+    window.services.identity_service.current_state = "no_face_detected"
+
+    window._warn_before_lock(30)
+    warning = window._lock_warning_box
+
+    assert warning is not None
+    assert "No face was detected" in warning.text()
+    assert window._lock_timer.isActive()
+
+    window._on_identity_state_changed("camera_unavailable", "Camera disconnected.")
 
     assert window._lock_warning_box is None
     assert not window._lock_timer.isActive()
@@ -275,10 +322,39 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
     assert dashboard.identity_verification_card.face_status.text().endswith("Face detected")
     assert dashboard.identity_verification_card.match_status.text().endswith("Identity matched")
     assert dashboard.identity_verification_card.motion_status.text().endswith(
-        "Liveness not confirmed"
+        "Motion not confirmed"
     )
     assert not dashboard.identity_summary.avatar.pixmap().isNull()
     assert not dashboard.identity_verification_card.avatar.pixmap().isNull()
+
+    pending_motion = IdentityEvent(
+        "pending-motion",
+        datetime.now(UTC),
+        "liveness_failure",
+        "liveness_failure",
+        0.987,
+        "awaiting_basic_motion",
+        "Basic facial movement was not observed in this short sample.",
+    )
+    dashboard.identity_summary.set_identity(
+        "Local user",
+        "liveness_failure",
+        pending_motion,
+        profile_image,
+    )
+    dashboard.identity_verification_card.set_identity(
+        "Local user",
+        False,
+        "liveness_failure",
+        pending_motion,
+        profile_image,
+    )
+    assert dashboard.identity_summary.state_label.text() == "MOTION NOT CONFIRMED"
+    assert dashboard.identity_verification_card.state_label.text() == "MOTION NOT CONFIRMED"
+    assert "not proof of spoofing" in dashboard.identity_verification_card.state_label.toolTip()
+    assert dashboard.identity_verification_card.motion_status.text().endswith(
+        "Motion not confirmed"
+    )
 
     dashboard.identity_verification_card.history_button.click()
     assert window.current_page_key == "verification-history"
@@ -312,9 +388,9 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
         {
             "Identity": (80, "4/5 recognized samples"),
             "Files": (92, "23/25 baseline paths without active alerts"),
-            "Processes": (50, "75/150 processes"),
-            "Network": (60, "3/5 remote"),
-            "Windows": (None, "No successful channel read"),
+            "Processes": (50, "75/150 processes", True),
+            "Network": (60, "3/5 remote", True),
+            "Windows": (None, "No successful channel read", False),
         }
     )
 
@@ -335,19 +411,22 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
     } == {
         "Identity": "80%",
         "Files": "92%",
-        "Processes": "50%",
-        "Network": "60%",
-        "Windows": "N/A",
+        "Processes": "Active",
+        "Network": "Active",
+        "Windows": "Inactive",
     }
+    assert score_card.factor_progress["Processes"].isHidden()
+    assert score_card.factor_indicators["Processes"].text() == "●"
+    assert score_card.factor_values["Windows"].styleSheet().find("#f04b67") >= 0
     assert score_card.factor_stats["Processes"].text() == "75/150 processes"
 
     score_card.set_factors(
         {
             "Identity": (80, "4/5 samples"),
             "Files": (92, "23/25 files"),
-            "Processes": (50, "75/150 processes"),
-            "Network": (60, "3/5 remote"),
-            "Windows": (40, "1/2 channels"),
+            "Processes": (50, "75/150 processes", False),
+            "Network": (60, "3/5 remote", True),
+            "Windows": (40, "1/2 channels", True),
         }
     )
     assert score_card.ring._score == 64.4
@@ -358,9 +437,9 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
     } == {
         "Identity": "80%",
         "Files": "92%",
-        "Processes": "50%",
-        "Network": "60%",
-        "Windows": "40%",
+        "Processes": "Inactive",
+        "Network": "Active",
+        "Windows": "Active",
     }
 
 

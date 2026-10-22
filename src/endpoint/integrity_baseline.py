@@ -188,7 +188,7 @@ class FileIntegrityMonitor:
                             f"Could not read file for integrity baseline {path}: {exc}"
                         ) from exc
                     snapshot[path] = (digest, stat.st_mtime_ns, stat.st_size)
-                    if progress_callback is not None and len(snapshot) % 100 == 0:
+                    if progress_callback is not None and len(snapshot) % 25 == 0:
                         progress_callback(len(snapshot))
         if progress_callback is not None:
             progress_callback(len(snapshot))

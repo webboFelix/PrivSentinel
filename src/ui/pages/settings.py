@@ -198,24 +198,22 @@ class SettingsPage(QWidget):
         )
         identity_form.addRow("Repeated unknown-face response", self.unknown_face_action)
         self.presence_loss_action = QComboBox()
+        self.presence_loss_action.addItem("Notify only (default)", "notify_only")
         self.presence_loss_action.addItem(
-            "Notify only (presence loss never locks)", "notify_only"
-        )
-        self.presence_loss_action.addItem(
-            "Legacy setting (presence loss never locks)", "lock_after_grace"
+            "Warn, then lock after grace period", "lock_after_grace"
         )
         self.presence_loss_action.setCurrentIndex(
             self.presence_loss_action.findData(
                 services.settings.presence_loss_action
             )
         )
-        identity_form.addRow("Enrolled identity absent", self.presence_loss_action)
+        identity_form.addRow("No face detected response", self.presence_loss_action)
         self.failure_limit = QSpinBox()
         self.failure_limit.setRange(1, 100)
         self.failure_limit.setValue(services.settings.identity_failure_limit)
-        identity_form.addRow("Consecutive failure limit", self.failure_limit)
+        identity_form.addRow("Consecutive failures before warning", self.failure_limit)
         self.automatic_lock = QCheckBox(
-            "Opt in to automatic workstation lock after an unknown-face warning"
+            "Opt in to automatic workstation lock after an identity warning"
         )
         self.automatic_lock.setChecked(
             services.settings.automatic_lock_enabled
@@ -239,8 +237,9 @@ class SettingsPage(QWidget):
         )
         identity_form.addRow("Notifications", self.identity_notifications)
         lock_notice = QLabel(
-            "Automatic locking is disabled by default. Camera failure never triggers "
-            "a lock. Locking requires explicit opt-in and a warning grace period."
+            "Automatic locking is disabled by default. Choose whether repeated unknown "
+            "faces, an absent face, or both trigger a warning and lock. Camera failure "
+            "never triggers a lock."
         )
         lock_notice.setObjectName("muted")
         lock_notice.setWordWrap(True)
@@ -461,23 +460,28 @@ class SettingsPage(QWidget):
             or not self.services.endpoint_service.has_file_baseline(roots, exclusions)
         )
         if self.automatic_lock.isChecked():
-            if self.unknown_face_action.currentData() != "lock_after_grace":
+            lock_conditions = []
+            if self.unknown_face_action.currentData() == "lock_after_grace":
+                lock_conditions.append("repeated unknown-face failures")
+            if self.presence_loss_action.currentData() == "lock_after_grace":
+                lock_conditions.append("the enrolled face remains undetected")
+            if not lock_conditions:
                 QMessageBox.warning(
                     self,
                     "Choose a locking response",
-                    "Select the unknown-face lock-after-grace response before "
-                    "opting into automatic workstation locking. Absence and camera "
-                    "failure never trigger a lock.",
+                    "Select a warn-then-lock response for unknown faces or no-face "
+                    "detection before opting into automatic workstation locking.",
                 )
                 return
+            trigger_text = " or ".join(lock_conditions)
             confirmation = QMessageBox.warning(
                 self,
                 "Confirm automatic workstation locking",
-                "When an unknown face reaches the configured failure threshold, the "
-                f"workstation will lock after a {self.lock_grace.value()}-second "
-                "warning. Verification of the enrolled identity dismisses the "
-                "warning; no-face and camera failures never cause a lock. Enable "
-                "this behavior?",
+                "When the configured failure threshold is reached for "
+                f"{trigger_text}, the workstation will lock after a "
+                f"{self.lock_grace.value()}-second warning. Verification of the "
+                "enrolled identity dismisses the warning; camera failure never "
+                "causes a lock. Enable this behavior?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import replace
 
 from PySide6.QtCore import QEvent, QThread, QTimer, Signal
@@ -66,6 +67,8 @@ class FileIntegrityPage(QWidget):
         self.services = services
         self._baseline_worker: _BaselineWorker | None = None
         self._resume_after_baseline = False
+        self._baseline_started_at: float | None = None
+        self._baseline_progress_count = 0
         self.setObjectName("page-file-integrity")
 
         layout = QVBoxLayout(self)
@@ -145,6 +148,9 @@ class FileIntegrityPage(QWidget):
         )
         self._refresh_timer.timeout.connect(self.refresh_data)
         self.refresh_data()
+        self._baseline_status_timer = QTimer(self)
+        self._baseline_status_timer.setInterval(1000)
+        self._baseline_status_timer.timeout.connect(self._refresh_baseline_progress)
 
     def _roots(self) -> tuple[str, ...]:
         return tuple(
@@ -240,6 +246,8 @@ class FileIntegrityPage(QWidget):
             self.status.set_state("error")
             return
         self._set_controls_enabled(False)
+        self._baseline_started_at = time.monotonic()
+        self._baseline_progress_count = 0
         self.status.set_text("Creating file baseline…")
         self.status.set_state("info")
         worker = _BaselineWorker(
@@ -253,28 +261,45 @@ class FileIntegrityPage(QWidget):
         worker.baselineFailed.connect(self._on_baseline_failed)
         worker.progressChanged.connect(self._on_baseline_progress)
         worker.finished.connect(self._on_baseline_finished)
+        self._refresh_baseline_progress()
+        self._baseline_status_timer.start()
         worker.start()
 
     def _on_baseline_progress(self, count: int) -> None:
-        self.status.set_text(f"Creating file baseline… hashed {count:,} files")
+        self._baseline_progress_count = count
+        self._refresh_baseline_progress()
+
+    def _refresh_baseline_progress(self) -> None:
+        if self._baseline_started_at is None:
+            return
+        elapsed = int(time.monotonic() - self._baseline_started_at)
+        if self._baseline_progress_count:
+            message = f"Hashing files… {self._baseline_progress_count:,} processed"
+        else:
+            message = "Scanning selected folders…"
+        self.status.set_text(f"{message} · {elapsed:,} sec elapsed")
         self.status.set_state("info")
 
     def _on_baseline_created(self, count: int) -> None:
-        self.status.set_text(f"Baseline established for {count:,} files")
-        self.status.set_state("success")
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
         if self._resume_after_baseline:
             self.enabled.setChecked(True)
             self._save_configuration()
         self.refresh_data()
 
     def _on_baseline_failed(self, message: str) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
         self.enabled.setChecked(False)
         self.enabled.setText("Enable monitoring")
+        self.refresh_data()
         self.status.set_text(f"Baseline failed: {message}")
         self.status.set_state("error")
-        self.refresh_data()
 
     def _on_baseline_finished(self) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
         self._set_controls_enabled(True)
         self._baseline_worker = None
 
@@ -351,15 +376,17 @@ class FileIntegrityPage(QWidget):
             )
             row_ids.append(str(event["id"]))
         self.table.set_rows(rows, row_ids)
-        self.status.set_text(
-            f"{len(baseline_rows):,} baseline files"
-            f"{'' if has_current_baseline else ' · baseline needs refresh for current configuration'} · "
-            f"{len(events):,} recorded changes · "
-            f"{'monitoring active' if self._is_running() else 'monitoring inactive'}"
-        )
-        self.status.set_state(
-            "success" if has_current_baseline else "warning"
-        )
+        worker = self._baseline_worker
+        if worker is None or not worker.isRunning():
+            self.status.set_text(
+                f"{len(baseline_rows):,} baseline files"
+                f"{'' if has_current_baseline else ' · baseline needs refresh for current configuration'} · "
+                f"{len(events):,} recorded changes · "
+                f"{'monitoring active' if self._is_running() else 'monitoring inactive'}"
+            )
+            self.status.set_state(
+                "success" if has_current_baseline else "warning"
+            )
 
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)

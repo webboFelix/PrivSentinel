@@ -311,6 +311,7 @@ class CameraMonitorWorker(QThread):
         self._last_face: tuple[int, int, int, int] | None = None
         self._failure_count = 0
         self._unknown_face_failures = 0
+        self._presence_loss_failures = 0
         self._lock_warning_issued = False
         self._monitor_started = time.monotonic()
         self._camera_error_reported = False
@@ -404,18 +405,12 @@ class CameraMonitorWorker(QThread):
                             self.settings.liveness_enabled
                             and liveness_result != "basic_motion_observed"
                         ):
-                            if liveness.sample_ready:
-                                state = "liveness_failure"
-                                detail = (
-                                    "Basic facial-landmark motion was not observed; "
-                                    "this is not a robust anti-spoofing result."
-                                )
-                            else:
-                                state = "low_confidence"
-                                detail = (
-                                    "Basic facial-landmark motion has not yet been "
-                                    "observed; this is not robust anti-spoofing."
-                                )
+                            state = "low_confidence"
+                            detail = (
+                                "Basic facial motion is not confirmed yet. Ask the "
+                                "person to move slightly; this heuristic is not "
+                                "evidence of spoofing."
+                            )
                         elif confidence >= self.settings.verification_threshold:
                             state = "recognized"
                             detail = "Enrolled identity recognized."
@@ -440,16 +435,21 @@ class CameraMonitorWorker(QThread):
                         self._failure_count += 1
                     if state == "unknown_face":
                         self._unknown_face_failures += 1
+                        self._presence_loss_failures = 0
+                    elif state == "no_face_detected":
+                        self._presence_loss_failures += 1
+                        self._unknown_face_failures = 0
                     else:
                         self._unknown_face_failures = 0
-                    action = (
-                        self.settings.presence_loss_action
-                        if state == "no_face_detected"
-                        else self.settings.unknown_face_action
-                    )
+                        self._presence_loss_failures = 0
+                    action = self.settings.presence_loss_action if (
+                        state == "no_face_detected"
+                    ) else self.settings.unknown_face_action
                     decision = self._policy.decide(
                         state,
-                        self._unknown_face_failures,
+                        self._presence_loss_failures
+                        if state == "no_face_detected"
+                        else self._unknown_face_failures,
                         self.settings.identity_failure_limit,
                         self.settings.automatic_lock_enabled,
                         action,
@@ -462,6 +462,9 @@ class CameraMonitorWorker(QThread):
                     )
             except Exception as exc:
                 if not self._stop_event.is_set():
+                    self._unknown_face_failures = 0
+                    self._presence_loss_failures = 0
+                    self._lock_warning_issued = False
                     self.stateChanged.emit("camera_unavailable", str(exc))
                     if not self._camera_error_reported:
                         self._handle_state(
@@ -523,4 +526,5 @@ class CameraMonitorWorker(QThread):
     def _clear_lock_warning_after_verification(self) -> None:
         self._failure_count = 0
         self._unknown_face_failures = 0
+        self._presence_loss_failures = 0
         self._lock_warning_issued = False

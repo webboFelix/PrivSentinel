@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
+import re
 import socket
+import subprocess
 from dataclasses import dataclass
 
 import psutil
@@ -30,6 +33,14 @@ class RemovableStorage:
 
 
 @dataclass(frozen=True, slots=True)
+class AttachedDevice:
+    instance_id: str
+    label: str
+    kind: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class HostTopology:
     hostname: str
     local_addresses: tuple[str, ...]
@@ -37,6 +48,7 @@ class HostTopology:
     endpoints: tuple[ActiveEndpoint, ...]
     removable_storage: tuple[RemovableStorage, ...]
     warnings: tuple[str, ...]
+    attached_devices: tuple[AttachedDevice, ...] = ()
 
 
 class HostTopologyCollector:
@@ -48,6 +60,7 @@ class HostTopologyCollector:
         gateways = self._default_gateways(warnings)
         endpoints = self._active_endpoints(warnings)
         removable = self._removable_storage(warnings)
+        devices = self._attached_devices(warnings)
         return HostTopology(
             hostname=socket.gethostname(),
             local_addresses=addresses,
@@ -55,7 +68,124 @@ class HostTopologyCollector:
             endpoints=endpoints,
             removable_storage=removable,
             warnings=tuple(warnings),
+            attached_devices=devices,
         )
+
+    @staticmethod
+    def _attached_devices(warnings: list[str]) -> tuple[AttachedDevice, ...]:
+        if os.name != "nt":
+            return ()
+        command = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$devices = @(Get-PnpDevice -PresentOnly | "
+            "Where-Object { ($_.InstanceId -match '^USB\\\\VID_' -and "
+            "$_.InstanceId -notmatch '&MI_') -or "
+            "$_.Class -in @('Ports', 'Monitor') } | "
+            "Select-Object Class, FriendlyName, InstanceId); "
+            "$displays = @(); "
+            "try { $displays = @(Get-CimInstance "
+            "-Namespace root\\wmi -ClassName WmiMonitorConnectionParams | "
+            "Select-Object InstanceName, VideoOutputTechnology) } catch { }; "
+            "[pscustomobject]@{ devices = $devices; displays = $displays } | "
+            "ConvertTo-Json -Compress -Depth 3"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    command,
+                ],
+                capture_output=True,
+                check=True,
+                encoding="utf-8",
+                timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            inventory = json.loads(result.stdout or "{}")
+        except (
+            FileNotFoundError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
+            warnings.append(f"Attached-device inventory unavailable: {exc}")
+            return ()
+
+        if not isinstance(inventory, dict):
+            warnings.append("Attached-device inventory returned an invalid response.")
+            return ()
+
+        display_types = {
+            0: "VGA",
+            4: "DVI",
+            5: "HDMI",
+            10: "DisplayPort",
+            11: "Embedded DisplayPort",
+        }
+        displays = inventory.get("displays", [])
+        display_rows = displays if isinstance(displays, list) else [displays]
+        display_connections = {
+            str(item.get("InstanceName", "")).casefold(): display_types.get(
+                item.get("VideoOutputTechnology")
+            )
+            for item in display_rows
+            if isinstance(item, dict) and item.get("InstanceName")
+        }
+        rows = inventory.get("devices", [])
+        device_rows = rows if isinstance(rows, list) else [rows]
+        devices: dict[str, AttachedDevice] = {}
+        active_displays = tuple(display_connections)
+        for item in device_rows:
+            if not isinstance(item, dict):
+                continue
+            instance_id = str(item.get("InstanceId", "")).strip()
+            if not instance_id:
+                continue
+            device_class = str(item.get("Class", "")).casefold()
+            friendly_name = str(item.get("FriendlyName") or "").strip()
+            if device_class == "ports":
+                if not instance_id.upper().startswith("USB\\VID_"):
+                    continue
+                kind = "serial"
+                port = re.search(r"\((COM\d+)\)", friendly_name, re.IGNORECASE)
+                label = port.group(1).upper() if port else "Serial port"
+            elif device_class == "monitor":
+                normalized_instance = instance_id.casefold()
+                active_instance = next(
+                    (
+                        display_instance
+                        for display_instance in active_displays
+                        if display_instance.startswith(normalized_instance)
+                        or normalized_instance.startswith(display_instance)
+                    ),
+                    None,
+                )
+                if active_instance is None:
+                    continue
+                kind = "display"
+                label = display_connections[active_instance] or "Monitor"
+            elif instance_id.upper().startswith("USB\\VID_"):
+                kind = "usb"
+                if not friendly_name:
+                    continue
+                label = friendly_name
+            else:
+                continue
+            physical_id = re.sub(r"&MI_\d+", "", instance_id, flags=re.IGNORECASE)
+            key = physical_id.casefold()
+            candidate = AttachedDevice(
+                instance_id=instance_id,
+                label=label,
+                kind=kind,
+                detail="Connected",
+            )
+            current = devices.get(key)
+            if current is None or (kind == "serial" and current.kind != "serial"):
+                devices[key] = candidate
+        return tuple(devices[key] for key in sorted(devices))
 
     @staticmethod
     def _local_addresses(warnings: list[str]) -> tuple[str, ...]:

@@ -1,9 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
-from src.endpoint.host_topology import ActiveEndpoint, HostTopology
+from src.endpoint.host_topology import ActiveEndpoint, AttachedDevice, HostTopology
 from src.ui.components.dashboard_summary import DashboardScoreCard
 from src.ui.components.integrity_activity_chart import FileIntegrityActivityChart
 from src.ui.components.threat_landscape import ThreatLandscapeWidget
+from src.ui.pages.verification_history import (
+    _liveness_result_label,
+    _verification_result_label,
+)
 
 
 def test_integrity_chart_aggregates_all_reference_categories(qtbot):
@@ -174,6 +178,81 @@ def test_topology_hides_hostname_ipv6_and_external_endpoint_lists(qtbot):
     assert widget.canvas._phase != initial_phase
 
 
+def test_topology_shows_only_connected_nodes_and_limits_preview_clutter(qtbot):
+    widget = ThreatLandscapeWidget()
+    qtbot.addWidget(widget)
+    peers = tuple(
+        ActiveEndpoint(
+            local_address="192.168.1.20",
+            local_port=51000 + index,
+            remote_address=f"192.168.1.{40 + index}",
+            remote_port=445,
+            protocol="TCP",
+            state="ESTABLISHED",
+            pid=None,
+            process_name="Unavailable",
+            username="Unavailable",
+        )
+        for index in range(4)
+    )
+    devices = tuple(
+        AttachedDevice(
+            instance_id=f"USB\\VID_1234&PID_5678\\DEVICE{index}",
+            label=f"Connected USB device {index}",
+            kind="usb",
+            detail="Connected",
+        )
+        for index in range(5)
+    )
+    topology = HostTopology(
+        hostname="workstation",
+        local_addresses=("192.168.1.20",),
+        gateways=(),
+        endpoints=peers,
+        removable_storage=(),
+        warnings=(),
+        attached_devices=devices,
+    )
+
+    widget.set_snapshot(topology, None, None)
+
+    assert "firewall" not in widget._node_by_key
+    assert "router:unknown" not in widget._node_by_key
+    assert "internet" not in widget._node_by_key
+    assert sum(node.kind == "endpoint" for node in widget._nodes) == 2
+    assert sum(node.kind == "usb" for node in widget._nodes) == 3
+    assert "endpoint-overflow" not in widget._node_by_key
+    assert "device:overflow" not in widget._node_by_key
+    assert all("DEVICE" not in widget.node_selector.itemText(i) for i in range(widget.node_selector.count()))
+    assert widget.quarantine_button.isHidden()
+    assert widget.block_button.isHidden()
+    assert widget.view_details_button.isHidden()
+
+
+def test_topology_details_hide_empty_fields_and_unavailable_actions(qtbot):
+    widget = ThreatLandscapeWidget()
+    qtbot.addWidget(widget)
+    topology = HostTopology(
+        hostname="workstation",
+        local_addresses=(),
+        gateways=(),
+        endpoints=(),
+        removable_storage=(),
+        warnings=(),
+    )
+
+    widget.set_snapshot(topology, None, None)
+
+    assert widget._field_rows["Process"][0].isHidden()
+    assert widget._field_rows["Remote IP"][0].isHidden()
+    assert widget._field_rows["Risk Score"][0].isHidden()
+    assert not widget._field_rows["Source"][0].isHidden()
+    assert not widget._field_rows["Details"][0].isHidden()
+    assert widget.quarantine_button.isHidden()
+    assert widget.block_button.isHidden()
+    assert widget.view_details_button.isHidden()
+
+
 def test_security_health_score_uses_level_colors_and_action_messages(qtbot):
     card = DashboardScoreCard()
     qtbot.addWidget(card)
@@ -192,3 +271,18 @@ def test_security_health_score_uses_level_colors_and_action_messages(qtbot):
     assert card.ring._score == 40
     assert card.ring._color.name() == "#f04b67"
     assert card.risk_label.text() == "AT RISK · TAKE ACTION"
+
+
+def test_history_describes_pending_motion_without_claiming_liveness_failure():
+    assert (
+        _verification_result_label("liveness_failure", "awaiting_basic_motion")
+        == "Motion not confirmed"
+    )
+    assert (
+        _liveness_result_label("low_confidence", "awaiting_basic_motion")
+        == "Motion not confirmed"
+    )
+    assert (
+        _liveness_result_label("recognized", "basic_motion_observed")
+        == "Basic motion observed"
+    )

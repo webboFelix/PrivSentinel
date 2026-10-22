@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -49,16 +49,17 @@ class _TopologyCanvas(QWidget):
         self._node_pixmaps = {
             "computer": QIcon(icon_path("security_appliance.png")).pixmap(32, 32),
             "internet": QIcon(icon_path("network_globe.png")).pixmap(32, 32),
-            "firewall": QIcon(icon_path("laptop_security.png")).pixmap(26, 26),
             "router": QIcon(icon_path("router.png")).pixmap(32, 32),
             "endpoint": QIcon(icon_path("security_appliance.png")).pixmap(26, 26),
             "usb": QIcon(icon_path("usb_drive.png")).pixmap(26, 26),
+            "serial": QIcon(icon_path("network-nodes.png")).pixmap(26, 26),
+            "display": QIcon(icon_path("security_appliance.png")).pixmap(26, 26),
         }
         self._phase = 0.0
         self._animation = QTimer(self)
         self._animation.setInterval(45)
         self._animation.timeout.connect(self._advance_animation)
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(180)
         self.setMouseTracking(True)
 
     def set_topology(
@@ -75,8 +76,20 @@ class _TopologyCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#071a31"))
-        center = QPointF(self.width() * 0.5, self.height() * 0.28)
+        center = QPointF(self.width() * 0.5, self.height() * 0.5)
         self._node_positions = self._positions(center)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for index, color in enumerate(("#164a70", "#123c60", "#0d3152")):
+            inset = index * 13
+            painter.setPen(QPen(QColor(color), 1, Qt.PenStyle.DashLine))
+            painter.drawEllipse(
+                QRectF(
+                    self.width() * 0.5 - self.width() * 0.41 + inset,
+                    self.height() * 0.52 - self.height() * 0.31 + inset * 0.45,
+                    self.width() * 0.82 - inset * 2,
+                    self.height() * 0.62 - inset * 0.9,
+                )
+            )
         edges = self._edges()
         for edge_index, (source, target) in enumerate(edges):
             start = self._node_positions[source]
@@ -98,36 +111,17 @@ class _TopologyCanvas(QWidget):
                 self._draw_node(painter, node, position)
 
     def _positions(self, center: QPointF) -> dict[str, QPointF]:
-        slots = {
-            "computer": center,
-            "internet": QPointF(self.width() * 0.84, center.y()),
-            "firewall": QPointF(self.width() * 0.39, self.height() * 0.55),
-            "usb": QPointF(self.width() * 0.61, self.height() * 0.55),
-        }
-        for node in self.nodes:
-            if node.kind == "router":
-                slots[node.key] = QPointF(self.width() * 0.16, center.y())
-        peers = [node for node in self.nodes if node.kind == "endpoint"]
-        for index, node in enumerate(peers):
-            fraction = (index + 1) / (len(peers) + 1)
-            base = QPointF(
-                self.width() * (0.12 + fraction * 0.76),
-                self.height() * 0.76,
+        slots = {"computer": center}
+        orbit_nodes = [node for node in self.nodes if node.kind != "computer"]
+        for index, node in enumerate(orbit_nodes):
+            angle = -math.pi / 2 + math.tau * index / max(1, len(orbit_nodes))
+            slots[node.key] = QPointF(
+                self.width() * 0.5 + math.cos(angle) * self.width() * 0.35,
+                self.height() * 0.5
+                + math.sin(angle) * self.height() * 0.31,
             )
-            base += QPointF(
-                math.sin(self._phase * math.tau + index) * 4.0,
-                math.cos(self._phase * math.tau + index) * 4.0,
-            )
-            slots[node.key] = base
-        for node in self.nodes:
-            if node.key not in slots:
-                continue
-            position = slots[node.key]
-            if node.kind == "router":
-                position += QPointF(0, math.sin(self._phase * math.tau) * 1.2)
-            if node.kind == "internet":
-                position += QPointF(0, math.cos(self._phase * math.tau) * 1.2)
-            slots[node.key] = center + (position - center) * self.zoom
+        for key, position in slots.items():
+            slots[key] = center + (position - center) * self.zoom
         return slots
 
     def _edges(self) -> tuple[tuple[str, str], ...]:
@@ -139,12 +133,8 @@ class _TopologyCanvas(QWidget):
         )
         if router and "computer" in available:
             edges.append((router, "computer"))
-        if "computer" in available and "internet" in available:
-            edges.append(("computer", "internet"))
         for node in self.nodes:
-            if node.kind in {"firewall", "usb"} and node.key in available:
-                edges.append(("computer", node.key))
-            elif node.kind == "endpoint" and node.key in available:
+            if node.key in available and node.kind not in {"computer", "router"}:
                 edges.append((router or "computer", node.key))
         return tuple(edges)
 
@@ -175,15 +165,28 @@ class _TopologyCanvas(QWidget):
             QPointF(position.x() - size / 2, position.y() - size / 2),
             self._node_pixmaps[node.kind],
         )
-        label = node.label if not node.address else f"{node.label}\n{node.address}"
+        label = node.label
         painter.setPen(QColor("#d8ebff"))
         painter.setFont(self.font())
-        label_rect = QRectF(position.x() - 66, position.y() + size / 2 + 5, 132, 36)
+        label_width = min(76, max(52, self.width() // max(5, len(self.nodes))))
+        label = QFontMetrics(self.font()).elidedText(
+            label,
+            Qt.TextElideMode.ElideMiddle,
+            label_width,
+        )
+        label_x = min(
+            max(2, position.x() - label_width / 2),
+            self.width() - label_width - 2,
+        )
+        label_y = (
+            position.y() + size / 2 + 3
+            if position.y() < self.height() * 0.5
+            else position.y() - size / 2 - 19
+        )
+        label_rect = QRectF(label_x, label_y, label_width, 16)
         painter.drawText(
             label_rect,
-            Qt.AlignmentFlag.AlignHCenter
-            | Qt.AlignmentFlag.AlignTop
-            | Qt.TextFlag.TextWordWrap,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
             label,
         )
 
@@ -278,8 +281,8 @@ class ThreatLandscapeWidget(QFrame):
 
         self.details = QFrame()
         self.details.setObjectName("threatDetails")
-        self.details.setMinimumWidth(190)
-        self.details.setMaximumWidth(270)
+        self.details.setMinimumWidth(165)
+        self.details.setMaximumWidth(230)
         detail_layout = QVBoxLayout(self.details)
         detail_layout.setContentsMargins(10, 8, 10, 8)
         detail_layout.setSpacing(5)
@@ -287,7 +290,7 @@ class ThreatLandscapeWidget(QFrame):
         detail_title = QLabel("Details")
         detail_title.setObjectName("sectionTitle")
         detail_header.addWidget(detail_title, 1)
-        self.severity_badge = QLabel("NO ACTIVE ALERT")
+        self.severity_badge = QLabel("CONNECTED")
         self.severity_badge.setObjectName("threatSeverity")
         detail_header.addWidget(self.severity_badge)
         detail_layout.addLayout(detail_header)
@@ -308,35 +311,44 @@ class ThreatLandscapeWidget(QFrame):
         fields.setHorizontalSpacing(7)
         fields.setVerticalSpacing(4)
         self.values: dict[str, QLabel] = {}
+        self._field_rows: dict[str, tuple[QLabel, QLabel]] = {}
         for row, name in enumerate(
-            ("Process", "PID", "User", "Source", "Remote IP", "Risk Score", "Details")
+            ("Process", "Source", "Remote IP", "Risk Score", "Details")
         ):
             label = QLabel(name)
             label.setObjectName("muted")
             value = QLabel("—")
             value.setWordWrap(True)
+            value.setMaximumHeight(38)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             fields.addWidget(label, row, 0)
             fields.addWidget(value, row, 1)
             self.values[name] = value
+            self._field_rows[name] = (label, value)
         detail_layout.addLayout(fields)
         self.quarantine_button = QPushButton("Quarantine")
         self.quarantine_button.setIcon(QIcon(icon_path("quarantine-box.png")))
-        self.quarantine_button.setEnabled(False)
         self.quarantine_button.clicked.connect(self._request_quarantine)
         self.block_button = QPushButton("Block IP")
         self.block_button.setIcon(QIcon(icon_path("laptop_security.png")))
-        self.block_button.setEnabled(False)
         self.block_button.clicked.connect(self._request_block)
         self.view_details_button = QPushButton("View Details")
         self.view_details_button.setIcon(QIcon(icon_path("file-search.png")))
         self.view_details_button.clicked.connect(self._view_details)
-        detail_layout.addWidget(self.quarantine_button)
-        detail_layout.addWidget(self.block_button)
-        detail_layout.addWidget(self.view_details_button)
+        actions = QHBoxLayout()
+        actions.setSpacing(4)
+        for button in (
+            self.quarantine_button,
+            self.block_button,
+            self.view_details_button,
+        ):
+            button.setMinimumWidth(0)
+            actions.addWidget(button)
+            button.hide()
+        detail_layout.addLayout(actions)
         content.addWidget(self.details, 3)
         layout.addLayout(content, 1)
-        self.setMinimumHeight(290)
+        self.setMinimumHeight(245)
 
     def set_snapshot(
         self,
@@ -358,34 +370,18 @@ class ThreatLandscapeWidget(QFrame):
         self.node_selector.blockSignals(True)
         self.node_selector.clear()
         for node in self._nodes:
-            label = node.label
-            if node.address:
-                label = f"{label} · {node.address}"
-            self.node_selector.addItem(label, node.key)
+            self.node_selector.addItem(node.label, node.key)
         selected_index = self.node_selector.findData(self._selected_key)
         self.node_selector.setCurrentIndex(max(0, selected_index))
         self.node_selector.blockSignals(False)
-        local_peer_count = len(
-            {
-                endpoint.remote_address
-                for endpoint in topology.endpoints
-                if _is_lan_ipv4(endpoint.remote_address)
-            }
+        local_peer_count = sum(node.kind == "endpoint" for node in self._nodes)
+        device_count = sum(
+            node.kind in {"usb", "serial", "display"} for node in self._nodes
         )
-        gateway_text = (
-            f"{len(topology.gateways)} gateway(s)"
-            if topology.gateways
-            else "gateway unavailable"
-        )
-        usb_count = len(topology.removable_storage)
         suffix = "; ".join(topology.warnings)
-        summary = (
-            f"This device · {gateway_text} · "
-            f"{local_peer_count:,} observed local peer(s) · "
-            f"{usb_count:,} removable device(s)"
-        )
+        summary = f"{device_count} connected device(s) · {local_peer_count} local peer(s)"
         if suffix:
-            summary += f" · Partial inventory: {suffix}"
+            summary += " · Inventory partial"
         self.topology_status.setText(summary)
         self._render_details()
 
@@ -429,10 +425,6 @@ class ThreatLandscapeWidget(QFrame):
                 or attributes.get("process")
                 or (node.connection.process_name if node.connection else "—")
             )
-            pid = str(attributes.get("pid") or (node.connection.pid if node.connection else "—"))
-            user = str(attributes.get("user") or attributes.get("username") or (
-                node.connection.username if node.connection else "—"
-            ))
             source = str(alert.get("source") or "Alert")
             risk = alert.get("risk_score")
             risk_text = f"{float(risk):.0f}/100" if risk is not None else "Not measured"
@@ -450,7 +442,6 @@ class ThreatLandscapeWidget(QFrame):
             title = f"Potential {finding.get('provider', 'malware')} match"
             severity = "REVIEW"
             process = node.connection.process_name if node.connection else "—"
-            pid = user = "—"
             source = f"{finding.get('provider', 'Scanner')}: {finding.get('rule', 'match')}"
             risk_text = "Not scored"
             remote_ip = (
@@ -468,8 +459,6 @@ class ThreatLandscapeWidget(QFrame):
             title = node.label
             severity = "NO VERDICT"
             process = node.connection.process_name if node.connection else "—"
-            pid = str(node.connection.pid) if node.connection and node.connection.pid else "—"
-            user = node.connection.username if node.connection else "—"
             source = node.kind.replace("-", " ").title()
             risk_text = "Not evaluated"
             remote_ip = (
@@ -484,15 +473,29 @@ class ThreatLandscapeWidget(QFrame):
         self.threat_title.setText(title)
         self.details.setToolTip(title)
         self.values["Process"].setText(process)
-        self.values["PID"].setText(pid)
-        self.values["User"].setText(user)
         self.values["Source"].setText(source)
         self.values["Remote IP"].setText(remote_ip)
         self.values["Risk Score"].setText(risk_text)
-        self.values["Details"].setText(details)
-        self.quarantine_button.setEnabled(
-            finding is not None and str(finding.get("id", "")).isdigit()
-        )
+        self.values["Details"].setText(details[:180])
+        visible_values = {
+            "Process": process,
+            "Source": source,
+            "Remote IP": remote_ip,
+            "Risk Score": risk_text,
+            "Details": details,
+        }
+        for name, (label_widget, value_widget) in self._field_rows.items():
+            visible = visible_values[name] not in {
+                "",
+                "—",
+                "Not measured",
+                "Not evaluated",
+            }
+            label_widget.setVisible(visible)
+            value_widget.setVisible(visible)
+        can_quarantine = finding is not None and str(finding.get("id", "")).isdigit()
+        self.quarantine_button.setVisible(can_quarantine)
+        self.quarantine_button.setEnabled(can_quarantine)
         selected_ip = (
             remote_ip
             if remote_ip != "—"
@@ -501,7 +504,14 @@ class ThreatLandscapeWidget(QFrame):
             else ""
         )
         self._block_address = selected_ip if _is_blockable_address(selected_ip) else ""
+        self.block_button.setVisible(bool(self._block_address))
         self.block_button.setEnabled(bool(self._block_address))
+        can_view_details = (
+            alert is not None
+            or finding is not None
+            or node.kind in {"endpoint", "usb", "serial", "display"}
+        )
+        self.view_details_button.setVisible(can_view_details)
         self.view_details_button.setToolTip(title)
 
     def _request_quarantine(self) -> None:
@@ -520,9 +530,9 @@ class ThreatLandscapeWidget(QFrame):
     def _view_details(self) -> None:
         if self._active_alert is not None:
             self.pageRequested.emit("alerts")
-        elif (
-            self._potential_finding is not None
-            or self._selected_key == "usb"
+        elif self._potential_finding is not None or (
+            self._selected_key in self._node_by_key
+            and self._node_by_key[self._selected_key].kind == "usb"
         ):
             self.pageRequested.emit("malware-protection")
         else:
@@ -539,29 +549,21 @@ def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
             address=local_address or "IP unavailable",
             detail="This device",
         ),
-        _TopologyNode(
-            "firewall",
-            "Firewall",
-            "firewall",
-            detail="Windows Firewall configuration is not queried by this inventory.",
-        ),
     ]
-    nodes.append(
-        _TopologyNode(
-            f"router:{topology.gateways[0] if topology.gateways else 'unknown'}",
-            "Router / gateway",
-            "router",
-            address=next(
-                (address for address in topology.gateways if _is_ipv4(address)),
-                "IPv4 unavailable",
-            ),
-            detail=(
-                "Default gateway reported by Windows"
-                if topology.gateways
-                else "Default gateway was not available from the local system"
-            ),
-        )
+    gateway = next(
+        (address for address in topology.gateways if _is_ipv4(address)),
+        None,
     )
+    if gateway:
+        nodes.append(
+            _TopologyNode(
+                f"router:{gateway}",
+                "Gateway",
+                "router",
+                address=gateway,
+                detail="Connected default gateway",
+            )
+        )
     unique_endpoints: dict[str, ActiveEndpoint] = {}
     for endpoint in topology.endpoints:
         if not _is_ipv4(endpoint.remote_address):
@@ -577,18 +579,15 @@ def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
         for address in unique_endpoints
         if _is_lan_ipv4(address)
     )
-    nodes.append(
-        _TopologyNode(
-            "internet",
-            "Internet",
-            "internet",
-            detail=(
-                f"{len(public_addresses):,} active public peer IP(s) observed"
-                if public_addresses
-                else "No active public peer connections observed"
-            ),
+    if public_addresses:
+        nodes.append(
+            _TopologyNode(
+                "internet",
+                "Internet",
+                "internet",
+                detail=f"{len(public_addresses):,} active public peer(s)",
+            )
         )
-    )
     nodes.extend(
         _TopologyNode(
             f"endpoint:{address}",
@@ -598,31 +597,49 @@ def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
             detail="Private IP observed in a current local connection",
             connection=unique_endpoints[address],
         )
-        for address in local_peers[:3]
+        for address in local_peers[:2]
     )
-    if len(local_peers) > 3:
-        nodes.append(
-            _TopologyNode(
-                "endpoint-overflow",
-                "More devices",
-                "endpoint",
-                detail=f"{len(local_peers) - 3:,} additional local peer(s)",
-            )
+    nodes.extend(
+        _TopologyNode(
+            f"device:{device.instance_id}",
+            _device_display_label(device.label, device.kind),
+            device.kind,
+            detail=device.detail,
         )
-    if topology.removable_storage:
+        for device in topology.attached_devices[:3]
+    )
+    if topology.removable_storage and not any(
+        device.kind == "usb" for device in topology.attached_devices
+    ):
         volume = topology.removable_storage[0]
         nodes.append(
             _TopologyNode(
-                "usb",
+                "device:removable-storage",
                 "USB storage",
                 "usb",
-                detail=(
-                    f"{len(topology.removable_storage):,} mounted removable volume(s); "
-                    f"example mount: {volume.mount_point} · no network IP"
-                ),
+                detail=f"Connected at {volume.mount_point}",
             )
         )
     return tuple(nodes)
+
+
+def _device_display_label(label: str, kind: str) -> str:
+    if kind == "serial":
+        return label if label.casefold().startswith("com") else "USB serial"
+    normalized = label.casefold()
+    if kind == "display":
+        if "displayport" in normalized:
+            return "DisplayPort"
+        if "vga" in normalized:
+            return "VGA"
+        if "hdmi" in normalized:
+            return "HDMI"
+        return "Display"
+    if "android" in normalized:
+        return "Android"
+    if "storage" in normalized or "drive" in normalized:
+        return "USB storage"
+    return "USB device"
 
 
 def _is_blockable_address(value: str) -> bool:

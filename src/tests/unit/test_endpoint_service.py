@@ -78,7 +78,7 @@ def test_baseline_reports_progress_while_hashing_files(tmp_path):
     )
 
     assert count == 101
-    assert progress == [100, 101]
+    assert progress == [25, 50, 75, 100, 101]
 
 
 def test_missing_baseline_root_is_reported_instead_of_saved_as_empty(tmp_path):

@@ -212,8 +212,27 @@ class DashboardIdentityCard(_SummaryCard):
             else state
         ).replace("_", " ").strip().upper()
         verified = current == "RECOGNIZED"
-        shown_state = "VERIFIED" if verified else current or "ENROLLED"
+        motion_pending = (
+            last_event is not None
+            and (
+                last_event.state == "liveness_failure"
+                or last_event.liveness == "awaiting_basic_motion"
+            )
+        )
+        shown_state = (
+            "VERIFIED"
+            if verified
+            else "MOTION NOT CONFIRMED"
+            if motion_pending
+            else current or "ENROLLED"
+        )
         self.state_label.setText(shown_state)
+        self.state_label.setToolTip(
+            "Basic facial movement was not observed in this short sample. "
+            "Move slightly to continue; this is not proof of spoofing."
+            if motion_pending
+            else shown_state
+        )
         self.state_label.setStyleSheet(
             "color:#18d89b;font-weight:700;"
             if verified
@@ -347,11 +366,29 @@ class IdentityVerificationCard(QFrame):
         if last_event is not None:
             state_value = last_event.state.casefold()
         verified = state_value == "recognized"
-        label = "VERIFIED" if verified else state_value.replace("_", " ").upper()
+        motion_pending = (
+            last_event is not None
+            and (
+                last_event.state == "liveness_failure"
+                or last_event.liveness == "awaiting_basic_motion"
+            )
+        )
+        label = (
+            "VERIFIED"
+            if verified
+            else "MOTION NOT CONFIRMED"
+            if motion_pending
+            else state_value.replace("_", " ").upper()
+        )
         if not label or label == "STOPPED":
             label = "ENROLLED"
         self.state_label.setText(label)
-        self.state_label.setToolTip(label)
+        self.state_label.setToolTip(
+            "Basic facial movement was not observed in this short sample. "
+            "Move slightly to continue; this is not proof of spoofing."
+            if motion_pending
+            else label
+        )
         confidence = last_event.confidence if last_event is not None else None
         self.confidence_label.setText(
             f"{confidence:.1%}"
@@ -378,7 +415,7 @@ class IdentityVerificationCard(QFrame):
         )
         self._set_status(
             self.motion_status,
-            "Liveness confirmed" if motion_observed else "Liveness not confirmed",
+            "Liveness confirmed" if motion_observed else "Motion not confirmed",
             motion_observed,
         )
         self.live_badge.setText("● LIVE" if monitoring else "● IDLE")
@@ -453,6 +490,7 @@ class DashboardScoreCard(_SummaryCard):
         self.factor_values: dict[str, QLabel] = {}
         self.factor_stats: dict[str, QLabel] = {}
         self.factor_progress: dict[str, QProgressBar] = {}
+        self.factor_indicators: dict[str, QLabel] = {}
         for index, name in enumerate(self._FACTORS):
             row = QHBoxLayout()
             row.setSpacing(5)
@@ -478,21 +516,40 @@ class DashboardScoreCard(_SummaryCard):
                 " border-radius: 3px; }"
             )
             progress.setToolTip("Measured percentage; hover for the sample details.")
+            indicator = QLabel()
+            indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            indicator.setMinimumWidth(48)
+            if name in {"Processes", "Network", "Windows"}:
+                progress.hide()
+                indicator.show()
+            else:
+                indicator.hide()
             row.addWidget(label)
             row.addWidget(progress, 1)
+            row.addWidget(indicator)
             row.addWidget(value)
             factors.addLayout(row)
             self.factor_values[name] = value
             self.factor_stats[name] = statistic
             self.factor_progress[name] = progress
+            self.factor_indicators[name] = indicator
         self.body_layout.addLayout(factors, 1)
 
-    def set_factors(self, values: Mapping[str, tuple[int | None, str]]) -> None:
+    def set_factors(
+        self,
+        values: Mapping[str, tuple[int | None, str] | tuple[int | None, str, bool]],
+    ) -> None:
         self.clear_error()
         coverage_scores = []
         missing_factors = []
         for name, label in self.factor_values.items():
-            score, statistic = values.get(name, (None, "No data"))
+            factor = values.get(name, (None, "No data"))
+            score, statistic = factor[:2]
+            indicator_active = (
+                factor[2]
+                if len(factor) == 3
+                else None
+            )
             if score is not None:
                 score = min(100, max(0, score))
                 coverage_scores.append(score)
@@ -500,13 +557,38 @@ class DashboardScoreCard(_SummaryCard):
                 missing_factors.append(name)
             self.factor_stats[name].setText(statistic)
             self.factor_stats[name].setToolTip(statistic)
-            detail = f"{name}: {statistic}; measured value: {score}%." if score is not None else (
-                f"{name}: {statistic}; percentage unavailable."
-            )
+            if indicator_active is not None:
+                detail = (
+                    f"{name}: {statistic}; collector is "
+                    f"{'active' if indicator_active else 'inactive'}."
+                )
+            elif score is not None:
+                detail = f"{name}: {statistic}; measured value: {score}%."
+            else:
+                detail = f"{name}: {statistic}; percentage unavailable."
             label.setToolTip(detail)
             self.factor_progress[name].setToolTip(detail)
             self.factor_values[name].setToolTip(detail)
-            self.factor_values[name].setText(f"{score}%" if score is not None else "N/A")
+            if indicator_active is None:
+                self.factor_values[name].setText(
+                    f"{score}%" if score is not None else "N/A"
+                )
+                self.factor_values[name].setStyleSheet(
+                    f"color:{self._FACTOR_COLORS[self._FACTORS.index(name)]};"
+                    "font-weight:700;"
+                )
+            else:
+                status_text = "Active" if indicator_active else "Inactive"
+                status_color = "#18d89b" if indicator_active else "#f04b67"
+                self.factor_values[name].setText(status_text)
+                self.factor_values[name].setStyleSheet(
+                    f"color:{status_color};font-weight:700;"
+                )
+                self.factor_indicators[name].setText("●")
+                self.factor_indicators[name].setStyleSheet(
+                    f"color:{status_color};font-size:11pt;"
+                )
+                self.factor_indicators[name].setToolTip(status_text)
             self.factor_progress[name].setValue(score or 0)
         if len(coverage_scores) == len(self._FACTORS):
             average = sum(coverage_scores) / len(coverage_scores)

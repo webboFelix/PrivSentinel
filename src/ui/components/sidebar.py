@@ -129,7 +129,7 @@ class Sidebar(QFrame):
 
     def set_alert_count(self, count: int) -> None:
         for badge in self._alert_badges.values():
-            badge.setText(str(count) if count < 100 else "99+")
+            badge.setText(str(count))
             badge.setVisible(count > 0)
 
     def _add_page_button(self, layout: QVBoxLayout, definition: PageDefinition) -> None:

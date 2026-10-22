@@ -17,7 +17,7 @@ class VerificationPolicy:
         consecutive_failures: int,
         failure_limit: int,
         automatic_lock_enabled: bool,
-        unknown_face_action: str,
+        action: str,
     ) -> PolicyDecision:
         if state == "camera_unavailable":
             return PolicyDecision(
@@ -25,13 +25,7 @@ class VerificationPolicy:
                 "Camera failure is not evidence of an attack.",
                 False,
             )
-        if state == "no_face_detected":
-            return PolicyDecision(
-                "notify",
-                "No face is currently present; this is not proof of an attack.",
-                False,
-            )
-        if state != "unknown_face":
+        if state not in {"unknown_face", "no_face_detected"}:
             return PolicyDecision("none", "No response is required.", False)
         if consecutive_failures < failure_limit:
             return PolicyDecision(
@@ -39,14 +33,26 @@ class VerificationPolicy:
                 "Failure limit has not been reached.",
                 False,
             )
-        if automatic_lock_enabled and unknown_face_action == "lock_after_grace":
+        if automatic_lock_enabled and action == "lock_after_grace":
+            reason = (
+                "Configured no-face failure threshold reached; "
+                "grace-period warning required."
+                if state == "no_face_detected"
+                else "Configured unknown-face failure threshold reached; "
+                "grace-period warning required."
+            )
             return PolicyDecision(
                 "warn_then_lock",
-                "Configured failure threshold reached; grace-period warning required.",
+                reason,
                 True,
             )
+        reason = (
+            "Repeated absence of the enrolled face recorded; workstation remains unlocked."
+            if state == "no_face_detected"
+            else "Repeated identity verification failure recorded; workstation remains unlocked."
+        )
         return PolicyDecision(
             "notify",
-            "Repeated identity verification failure recorded; workstation remains unlocked.",
+            reason,
             False,
         )

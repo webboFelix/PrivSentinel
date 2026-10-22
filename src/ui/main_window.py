@@ -847,9 +847,18 @@ class MainWindow(QMainWindow):
         self.recognitionModelPreparationFinished.emit(False, message)
 
     def _warn_before_lock(self, grace_seconds: int) -> None:
+        state = self.services.identity_service.current_state
+        configured_response = (
+            self.services.settings.unknown_face_action
+            if state == "unknown_face"
+            else self.services.settings.presence_loss_action
+            if state == "no_face_detected"
+            else "notify_only"
+        )
         if (
             not self.services.settings.automatic_lock_enabled
-            or self.services.identity_service.current_state != "unknown_face"
+            or state not in {"unknown_face", "no_face_detected"}
+            or configured_response != "lock_after_grace"
             or self._lock_warning_box is not None
         ):
             return
@@ -857,13 +866,15 @@ class MainWindow(QMainWindow):
         box = _LockWarningBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Identity security warning")
-        box.setText(
-            "An unknown face was detected. "
-            f"The workstation will lock in {grace_seconds} seconds."
+        condition = (
+            "No face was detected"
+            if state == "no_face_detected"
+            else "An unknown face was detected"
         )
+        box.setText(f"{condition}. The workstation will lock in {grace_seconds} seconds.")
         box.setInformativeText(
-            "This is a basic face-motion check, not robust anti-spoofing. "
-            "Camera failure never triggers this response."
+            "The warning cannot be cancelled. Recognizing the enrolled identity "
+            "dismisses it automatically. Camera failure never triggers a lock."
         )
         box.setStandardButtons(QMessageBox.StandardButton.NoButton)
         box.setEscapeButton(QMessageBox.StandardButton.NoButton)
@@ -873,10 +884,10 @@ class MainWindow(QMainWindow):
         self._lock_timer.start(grace_seconds * 1000)
 
     def _complete_lock_warning(self) -> None:
+        state = self.services.identity_service.current_state
         if (
             not self.services.settings.automatic_lock_enabled
-            or self.services.identity_service.current_state
-            in {"recognized", "stopped"}
+            or state in {"recognized", "stopped", "camera_unavailable"}
         ):
             self._dismiss_lock_warning()
             return
@@ -900,7 +911,7 @@ class MainWindow(QMainWindow):
             box.accept()
 
     def _on_identity_state_changed(self, state: str, _detail: str) -> None:
-        if state in {"recognized", "stopped"}:
+        if state in {"recognized", "stopped", "camera_unavailable"}:
             self._identity_warning_active = False
             self._dismiss_lock_warning()
         self._update_dashboard_identity()
@@ -932,14 +943,13 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         try:
-            alerts = self.services.security_repository.list_alerts(limit=10000)
+            row = self.services.database.fetchone(
+                "SELECT COUNT(*) AS count FROM alerts WHERE status = 'open'"
+            )
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.statusBar().showMessage(f"Could not read alert count: {exc}", 10000)
             return
-        count = sum(
-            alert["status"] in {"open", "acknowledged", "investigating"}
-            for alert in alerts
-        )
+        count = int(row["count"]) if row is not None else 0
         self.topbar.set_alert_count(count)
         self.sidebar.set_alert_count(count)
 

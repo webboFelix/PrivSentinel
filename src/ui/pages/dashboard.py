@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import psutil
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import QEvent, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QFrame,
@@ -48,6 +48,23 @@ def _ratio_percent(numerator: int, denominator: int) -> int | None:
     return min(100, max(0, round(numerator * 100 / denominator)))
 
 
+class _TopologyRefreshWorker(QThread):
+    snapshotReady = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, collector: HostTopologyCollector, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.collector = collector
+
+    def run(self) -> None:
+        try:
+            snapshot = self.collector.collect()
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.failed.emit(str(exc))
+            return
+        self.snapshotReady.emit(snapshot)
+
+
 class DashboardPage(QWidget):
     actionRequested = Signal(str)
     pageRequested = Signal(str)
@@ -69,6 +86,7 @@ class DashboardPage(QWidget):
         self.services = services
         self._process_snapshot = ProcessMonitor(services.settings.process_exclusions)
         self._topology_collector = HostTopologyCollector()
+        self._topology_worker: _TopologyRefreshWorker | None = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 10)
         outer.setSpacing(8)
@@ -241,12 +259,21 @@ class DashboardPage(QWidget):
         self._refresh_timer.setInterval(15_000)
         self._refresh_timer.timeout.connect(self.refresh_security_data)
         self._refresh_timer.start()
+        self._topology_refresh_timer = QTimer(self)
+        self._topology_refresh_timer.setInterval(5000)
+        self._topology_refresh_timer.timeout.connect(self.refresh_host_topology)
         self.refresh_security_data()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._responsive_layout_active = True
+        self._topology_refresh_timer.start()
+        self.refresh_host_topology()
         self._update_responsive_layout()
+
+    def hideEvent(self, event: QEvent) -> None:
+        self._topology_refresh_timer.stop()
+        super().hideEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -511,6 +538,7 @@ class DashboardPage(QWidget):
                 "Processes": (
                     process_score,
                     process_statistic,
+                    process_worker_running,
                 ),
                 "Network": (
                     network_score,
@@ -519,10 +547,12 @@ class DashboardPage(QWidget):
                         if network_counts is not None
                         else "not measured"
                     ),
+                    network_worker_running,
                 ),
                 "Windows": (
                     windows_score,
                     windows_statistic,
+                    windows_worker_running,
                 ),
             }
         )
@@ -563,6 +593,7 @@ class DashboardPage(QWidget):
             detail_tooltip = f"{tooltip}\nCurrent sample: {details}"
             self.score_summary.factor_values[name].setToolTip(detail_tooltip)
             self.score_summary.factor_progress[name].setToolTip(detail_tooltip)
+            self.score_summary.factor_indicators[name].setToolTip(detail_tooltip)
 
         now_local = datetime.now().astimezone()
         hourly = [
@@ -620,8 +651,10 @@ class DashboardPage(QWidget):
         )
 
     def refresh_host_topology(self) -> None:
+        worker = self._topology_worker
+        if worker is not None and worker.isRunning():
+            return
         try:
-            topology = self._topology_collector.collect()
             alerts = self.services.security_repository.list_alerts(
                 limit=1, status="open"
             )
@@ -633,15 +666,39 @@ class DashboardPage(QWidget):
             finding = dict(finding_row) if finding_row is not None else None
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.threat_chart.set_status(
-                f"Could not refresh local host or alert context: {exc}",
+                f"Could not refresh alert context: {exc}",
                 error=True,
             )
             return
-        self.threat_chart.set_snapshot(
-            topology,
-            alerts[0] if alerts else None,
-            finding,
+        worker = _TopologyRefreshWorker(self._topology_collector, self)
+        self._topology_worker = worker
+        worker.snapshotReady.connect(
+            lambda topology, active_alert=alerts[0] if alerts else None, current_finding=finding:
+            self.threat_chart.set_snapshot(
+                topology,
+                active_alert,
+                current_finding,
+            )
         )
+        worker.failed.connect(
+            lambda message: self.threat_chart.set_status(
+                f"Could not refresh local host topology: {message}",
+                error=True,
+            )
+        )
+        worker.finished.connect(lambda worker=worker: self._topology_finished(worker))
+        worker.start()
+
+    def _topology_finished(self, worker: _TopologyRefreshWorker) -> None:
+        if self._topology_worker is worker:
+            self._topology_worker = None
+        worker.deleteLater()
+
+    def stop_workers(self) -> None:
+        worker = self._topology_worker
+        if worker is not None and worker.isRunning():
+            worker.wait(7000)
+        self._topology_worker = None
 
     def refresh_integrity_activity(self) -> None:
         try:
