@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
 import psutil
-from PySide6.QtCore import QEvent, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QFrame,
@@ -197,16 +197,9 @@ class DashboardPage(QWidget):
         )
         self.feed = DashboardLiveFeed()
         self.feed.viewAllRequested.connect(lambda: self.pageRequested.emit("alerts"))
-        self.network_card = self._status_card(
-            "Network",
-            "Connection metadata collection is disabled.",
-            "Open Network Monitor",
-            "network-monitor",
-            "network-nodes.png",
-        )
         self.process_card = self._status_card(
             "Process",
-            "Process collection is disabled.",
+            "Connected\nMonitoring",
             "Open Process Monitor",
             "process-monitor",
             "processor.png",
@@ -220,10 +213,17 @@ class DashboardPage(QWidget):
         )
         self.camera_card = self._status_card(
             "Camera",
-            "Camera access is disabled.",
+            "Disabled",
             "Open Identity Protection",
             "identity-protection",
             "camera.png",
+        )
+        self.voice_card = self._status_card(
+            "Voice Assistant",
+            "Enabled\nUse microphone",
+            "Start offline voice search",
+            "voice-search",
+            "microphone.png",
         )
         self.identity_card = self.camera_card
         self.network_activity = DashboardNetworkPanel()
@@ -238,22 +238,29 @@ class DashboardPage(QWidget):
         self.process_activity.setMinimumHeight(100)
         self.collector_status = QFrame()
         self.collector_status.setObjectName("panel")
-        self.collector_status.setMinimumHeight(88)
-        collector_layout = QHBoxLayout(self.collector_status)
-        collector_layout.setContentsMargins(3, 3, 3, 3)
-        collector_layout.setSpacing(5)
-        for card in (
-            self.network_card,
-            self.process_card,
-            self.windows_card,
-            self.camera_card,
+        self.collector_status.setMinimumHeight(124)
+        collector_layout = QGridLayout(self.collector_status)
+        collector_layout.setContentsMargins(6, 6, 6, 6)
+        collector_layout.setHorizontalSpacing(6)
+        collector_layout.setVerticalSpacing(6)
+        for index, card in enumerate(
+            (
+                self.camera_card,
+                self.process_card,
+                self.windows_card,
+                self.voice_card,
+            )
         ):
             card.setMinimumWidth(0)
             card.setSizePolicy(
-                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Preferred,
             )
-            collector_layout.addWidget(card, 1)
+            row, column = divmod(index, 2)
+            collector_layout.addWidget(card, row, column)
+        for index in range(2):
+            collector_layout.setColumnStretch(index, 1)
+            collector_layout.setRowStretch(index, 1)
 
         grid.addWidget(self.alert_chart, 1, 0, 1, 8)
         grid.addWidget(self.threat_chart, 1, 8, 1, 8)
@@ -629,9 +636,6 @@ class DashboardPage(QWidget):
         else:
             self.process_activity.set_processes(process_snapshot[:4])
         self._set_collector_summary(
-            "Network", self.services.settings.network_monitoring_enabled
-        )
-        self._set_collector_summary(
             "Process", self.services.settings.process_monitoring_enabled
         )
         self._set_collector_summary(
@@ -807,9 +811,9 @@ class DashboardPage(QWidget):
     def set_camera_state(self, state: str, detail: str) -> None:
         descriptions = {
             "disabled": ("Disabled", False),
-            "idle": ("Ready · not streaming", False),
-            "connecting": ("Connecting…", False),
-            "connected": ("Active · Streaming", True),
+            "idle": ("Ready\nNot streaming", False),
+            "connecting": ("Connecting", False),
+            "connected": ("Active\nStreaming", True),
             "unavailable": ("Unavailable", False),
         }
         body = self.camera_card.findChild(QLabel, "cardBody")
@@ -822,18 +826,14 @@ class DashboardPage(QWidget):
 
     def _set_collector_summary(self, title: str, enabled: bool) -> None:
         sources = {
-            "Network": "network",
             "Process": "process",
             "Windows Logs": "windows-event-log",
-            "Camera": "camera",
         }
         card = next(
             card
             for card in (
-                self.network_card,
                 self.process_card,
                 self.windows_card,
-                self.camera_card,
             )
             if card.property("cardTitle") == title
         )
@@ -847,14 +847,23 @@ class DashboardPage(QWidget):
         worker = self.services.endpoint_service.workers.get(sources[title])
         running = worker is not None and worker.isRunning()
         body.setText(
-            "Active · Collecting"
+            "Connected\nMonitoring"
             if running
-            else "Enabled · Not running"
+            else "Enabled\nNot running"
             if enabled
             else "Disabled"
         )
         body.setStyleSheet(
             "color: #18d89b;" if running else "color: #8ea9c8;"
+        )
+
+    def set_voice_assistant_active(self, active: bool) -> None:
+        body = self.voice_card.findChild(QLabel, "cardBody")
+        body.setText(
+            "Enabled\nListening" if active else "Enabled\nUse microphone"
+        )
+        body.setStyleSheet(
+            "color: #18d89b;" if active else "color: #00c7c7;"
         )
 
     def _status_card(
@@ -868,38 +877,48 @@ class DashboardPage(QWidget):
         card = QFrame()
         card.setObjectName("collectorStatusCard")
         card.setProperty("cardTitle", title)
-        card.setMinimumHeight(62)
+        card.setMinimumHeight(52)
         card.setMinimumWidth(0)
         card.setStyleSheet(
             "QFrame#collectorStatusCard { background-color: #071a31; "
             "border: 1px solid #16466a; border-radius: 9px; }"
         )
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(6, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
         icon_label = QLabel()
-        icon_label.setPixmap(QIcon(icon_path(icon)).pixmap(17, 17))
+        icon_label.setPixmap(QIcon(icon_path(icon)).pixmap(15, 15))
+        icon_label.setFixedSize(18, 18)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(icon_label, 0)
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(2)
-        heading = QLabel(title)
+        text_layout.setSpacing(3)
+        heading = QPushButton(title)
         heading.setObjectName("sectionTitle")
-        heading.setStyleSheet("font-size: 8pt;")
+        heading.setStyleSheet(
+            "QPushButton { color: #d8ebff; font-size: 8pt; font-weight: 600; "
+            "text-align: left; padding: 0; border: 0; background: transparent; }"
+        )
         heading.setMinimumWidth(0)
+        heading.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        heading.setToolTip(action)
+        if page_key == "voice-search":
+            heading.clicked.connect(
+                lambda: self.actionRequested.emit("voice-search")
+            )
+        else:
+            heading.clicked.connect(lambda: self.pageRequested.emit(page_key))
         body = QLabel(message)
         body.setObjectName("cardBody")
         body.setProperty("class", "muted")
-        body.setStyleSheet("color: #8ea9c8; font-size: 7pt;")
+        body.setStyleSheet("color: #00c7c7; font-size: 8pt;")
         body.setMinimumWidth(0)
         body.setWordWrap(True)
-        body.setMaximumHeight(28)
+        body.setMaximumHeight(36)
         text_layout.addWidget(heading)
         text_layout.addWidget(body)
         layout.addLayout(text_layout, 1)
-        button = QPushButton("›")
-        button.setFixedSize(14, 20)
-        button.setStyleSheet("padding: 0; font-size: 10pt;")
-        button.setToolTip(action)
-        button.clicked.connect(lambda: self.pageRequested.emit(page_key))
-        layout.addWidget(button)
         return card

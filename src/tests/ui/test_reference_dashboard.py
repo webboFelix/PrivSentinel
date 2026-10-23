@@ -88,10 +88,17 @@ def test_threat_landscape_displays_real_alert_and_emits_guarded_actions(qtbot):
     assert "198.51.100.17" not in widget.node_selector.currentText()
     assert widget._node_by_key["computer"].label == "This device"
     assert widget._node_by_key["computer"].address == "192.168.1.20"
-    assert set(widget._node_by_key) == {"computer"}
+    assert set(widget._node_by_key) == {"computer", "gateway:192.168.1.1"}
+    assert widget._node_by_key["gateway:192.168.1.1"].address == "192.168.1.1"
     assert widget.values["Process"].text() == "browser.exe"
     assert widget.values["IP address"].text() == endpoint.remote_address
     assert widget.values["Connection"].text() == "Risk 76/100"
+    widget.node_selector.setCurrentIndex(
+        widget.node_selector.findData("gateway:192.168.1.1")
+    )
+    assert widget.values["IP address"].text() == "192.168.1.1"
+    assert widget.values["Connection"].text() == "Active default gateway"
+    widget.node_selector.setCurrentIndex(widget.node_selector.findData("computer"))
     assert widget.block_button.isEnabled()
     with qtbot.waitSignal(widget.blockIpRequested) as signal:
         widget.block_button.click()
@@ -111,7 +118,7 @@ def test_threat_landscape_displays_real_alert_and_emits_guarded_actions(qtbot):
     assert signal.args == [42]
 
 
-def test_topology_exposes_host_and_peer_addresses_only_in_selected_details(qtbot):
+def test_topology_shows_primary_host_ip_and_gateway_but_no_remote_peers(qtbot):
     widget = ThreatLandscapeWidget()
     qtbot.addWidget(widget)
     local_endpoint = ActiveEndpoint(
@@ -154,6 +161,8 @@ def test_topology_exposes_host_and_peer_addresses_only_in_selected_details(qtbot
         endpoints=(local_endpoint, ipv6_endpoint, public_endpoint),
         removable_storage=(),
         warnings=(),
+        primary_address="192.168.1.20",
+        primary_interface="Wi-Fi",
     )
 
     widget.set_snapshot(topology, None, None)
@@ -161,19 +170,21 @@ def test_topology_exposes_host_and_peer_addresses_only_in_selected_details(qtbot
     initial_phase = widget.canvas._phase
     qtbot.wait(70)
 
-    assert widget._node_by_key["computer"].address == (
-        "169.254.10.20, 192.168.1.20, fe80::abcd"
+    assert widget._node_by_key["computer"].address == "192.168.1.20"
+    assert "fe80::abcd" not in widget._node_by_key["computer"].other_addresses
+    assert widget.topology_status.text() == (
+        "Host 192.168.1.20 · Gateway 192.168.1.1 · 0 device(s) / 0 port(s)"
     )
-    assert "fe80::abcd" in widget._node_by_key["computer"].address
-    assert widget.topology_status.text() == "This device · 0 connected device(s)"
     assert "fe80" not in widget.topology_status.text()
     assert all(
-        widget.node_selector.itemText(index) == "This device"
+        widget.node_selector.itemText(index) in {"This device", "Gateway"}
         for index in range(widget.node_selector.count())
     )
-    assert widget.node_selector.count() == 1
-    assert widget.values["IP address"].text() == (
-        "169.254.10.20, 192.168.1.20, fe80::abcd"
+    assert widget.node_selector.count() == 2
+    assert widget.values["IP address"].text() == "192.168.1.20"
+    assert widget.values["Other local IPs"].text() == "—"
+    assert widget.values["Connection"].text() == (
+        "Wi-Fi · default route via 192.168.1.1"
     )
     assert widget.canvas._phase != initial_phase
 
@@ -201,6 +212,7 @@ def test_topology_shows_all_current_peers_and_connected_devices(qtbot):
             label=f"Connected USB device {index}",
             kind="usb",
             detail="Connected",
+            port_name="USB",
         )
         for index in range(5)
     )
@@ -217,7 +229,6 @@ def test_topology_shows_all_current_peers_and_connected_devices(qtbot):
     widget.set_snapshot(topology, None, None)
 
     assert "firewall" not in widget._node_by_key
-    assert "router:unknown" not in widget._node_by_key
     assert "internet" not in widget._node_by_key
     assert sum(node.kind == "endpoint" for node in widget._nodes) == 0
     assert sum(node.kind == "usb" for node in widget._nodes) == 5
@@ -227,7 +238,10 @@ def test_topology_shows_all_current_peers_and_connected_devices(qtbot):
         "DEVICE" not in widget.node_selector.itemText(i)
         for i in range(widget.node_selector.count())
     )
-    assert widget.topology_status.text() == "This device · 5 connected device(s)"
+    assert widget.topology_status.text() == (
+        "Host 192.168.1.20 · Gateway unavailable · 5 device(s) / 5 port(s)"
+    )
+    assert "USB: Connected USB device 0" in widget.values["Ports"].text()
     assert widget.quarantine_button.isHidden()
     assert widget.block_button.isHidden()
     assert widget.view_details_button.isHidden()
@@ -241,6 +255,7 @@ def test_selected_usb_device_explicitly_reports_no_network_ip(qtbot):
         label="Nokia C30",
         kind="usb",
         detail="Connected · Error",
+        port_name="USB",
     )
     widget.set_snapshot(
         HostTopology(

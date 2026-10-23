@@ -40,6 +40,20 @@ class AttachedDevice:
     label: str
     kind: str
     detail: str
+    port_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkInterface:
+    name: str
+    addresses: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalPort:
+    name: str
+    device: str
+    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +65,10 @@ class HostTopology:
     removable_storage: tuple[RemovableStorage, ...]
     warnings: tuple[str, ...]
     attached_devices: tuple[AttachedDevice, ...] = ()
+    network_interfaces: tuple[NetworkInterface, ...] = ()
+    primary_address: str = ""
+    primary_interface: str = ""
+    physical_ports: tuple[PhysicalPort, ...] = ()
 
 
 class HostTopologyCollector:
@@ -63,28 +81,53 @@ class HostTopologyCollector:
         warnings: list[str] = []
         route_warnings: list[str] = []
         device_warnings: list[str] = []
+        interfaces = self._active_interfaces(warnings)
+        addresses = tuple(
+            sorted(
+                {address for interface in interfaces for address in interface.addresses},
+                key=lambda value: (":" in value, value),
+            )
+        )
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="host-topology") as pool:
-            gateway_task = pool.submit(self._default_gateways, route_warnings)
+            route_task = pool.submit(
+                self._active_default_route,
+                route_warnings,
+                addresses,
+            )
             device_task = pool.submit(
                 self._attached_devices,
                 device_warnings,
                 self._attached_device_cache,
             )
-            addresses = self._local_addresses(warnings)
             endpoints = self._active_endpoints(warnings)
             removable = self._removable_storage(warnings)
-            gateways = gateway_task.result()
+            route = route_task.result()
             devices = device_task.result()
         warnings.extend(route_warnings)
         warnings.extend(device_warnings)
+        gateway, primary_address = route if route is not None else ("", "")
+        interface_by_address = {
+            address: interface.name
+            for interface in interfaces
+            for address in interface.addresses
+        }
+        physical_ports = tuple(
+            PhysicalPort(device.port_name, device.label, device.detail)
+            for device in devices
+            if device.port_name
+        )
         return HostTopology(
             hostname=socket.gethostname(),
             local_addresses=addresses,
-            gateways=gateways,
+            gateways=(gateway,) if gateway else (),
             endpoints=endpoints,
             removable_storage=removable,
             warnings=tuple(warnings),
             attached_devices=devices,
+            network_interfaces=interfaces,
+            primary_address=primary_address,
+            primary_interface=interface_by_address.get(primary_address, ""),
+            physical_ports=physical_ports,
         )
 
     @staticmethod
@@ -111,8 +154,11 @@ class HostTopologyCollector:
             "Where-Object { ($_.Class -eq 'USB' -and "
             "$_.InstanceId -match '^USB\\\\VID_' -and "
             "$_.InstanceId -notmatch '&MI_') -or $_.Class -eq 'WPD' -or "
-            "($_.Class -eq 'Ports' -and $_.InstanceId -match '^USB\\\\' -and "
+            "($_.Class -eq 'Ports' -and "
             "$_.FriendlyName -match '\\(COM\\d+\\)') -or "
+            "($_.Class -in @('HIDClass', 'Keyboard', 'Mouse', 'Bluetooth') -and "
+            "$_.InstanceId -match '^(USB|BTH|HID)\\\\' -and "
+            "$_.InstanceId -notmatch '&MI_') -or "
             "$_.Class -eq 'Monitor' } | "
             "ForEach-Object { "
             "$device = $_; "
@@ -126,7 +172,7 @@ class HostTopologyCollector:
             "(($registry.Capabilities -band 4) -ne 0); "
             "$descriptionQueried = $removable -and "
             "$device.Class -in @('USB', 'WPD') -and "
-            "$device.FriendlyName -match '^(USB Composite Device|MTP USB Device|USB Device)$'; "
+            "$device.FriendlyName -match '^(USB Composite Device|MTP USB Device|USB Device|HID-compliant .*|Bluetooth Device)$'; "
             "$descriptionValue = if ($cached) { $cached.BusDescription } "
             "elseif ($descriptionQueried) "
             "{ (Get-PnpDeviceProperty -InstanceId $device.InstanceId "
@@ -267,6 +313,7 @@ class HostTopologyCollector:
             device_class = str(item.get("Class", "")).casefold()
             friendly_name = str(item.get("FriendlyName") or "").strip()
             status = str(item.get("Status") or "Unknown")
+            port_name = ""
             if device_class == "monitor":
                 if "integrated" in friendly_name.casefold():
                     continue
@@ -285,6 +332,33 @@ class HostTopologyCollector:
                 kind = "display"
                 label = display_connections[active_instance] or "Monitor"
                 detail = f"Connected · {status}"
+                port_name = label
+            elif device_class == "ports":
+                port_match = re.search(
+                    r"\((COM\d+)\)",
+                    friendly_name,
+                    re.IGNORECASE,
+                )
+                product_match = re.match(
+                    r"^(USB\\VID_[^&\\]+&PID_[^&\\]+)",
+                    instance_id,
+                    re.IGNORECASE,
+                )
+                if (
+                    port_match is None
+                    or product_match is None
+                    or item.get("RemovalPolicy") != 3
+                    or removable_product_counts.get(
+                        product_match.group(1).casefold()
+                    )
+                    != 1
+                ):
+                    continue
+                port_name = port_match.group(1).upper()
+                kind = "serial"
+                label = port_name
+                detail = f"Connected · {friendly_name}"
+                container_id = ""
             elif device_class == "wpd":
                 if (
                     not instance_id.upper().startswith("USB\\VID_")
@@ -294,8 +368,29 @@ class HostTopologyCollector:
                 kind = "usb"
                 label = str(item.get("BusDescription") or friendly_name).strip()
                 if not label or label.casefold() == "mtp usb device":
-                    label = "USB phone"
+                    label = "Portable device"
                 detail = f"Connected · {status}"
+                port_name = "USB"
+            elif device_class in {"hidclass", "keyboard", "mouse", "bluetooth"}:
+                if item.get("RemovalPolicy") != 3:
+                    continue
+                if "&MI_" in instance_id.upper():
+                    continue
+                kind = (
+                    "bluetooth"
+                    if instance_id.upper().startswith("BTH\\")
+                    or device_class == "bluetooth"
+                    else "usb"
+                )
+                label = str(item.get("BusDescription") or friendly_name).strip()
+                if not label or label.casefold().startswith("hid-compliant"):
+                    label = (
+                        "Bluetooth device"
+                        if kind == "bluetooth"
+                        else "USB input device"
+                    )
+                detail = f"Connected · {status}"
+                port_name = "Bluetooth" if kind == "bluetooth" else "USB"
             elif instance_id.upper().startswith("USB\\VID_"):
                 if (
                     "&MI_" in instance_id.upper()
@@ -307,6 +402,7 @@ class HostTopologyCollector:
                 if not label or label.casefold() == "usb composite device":
                     label = "USB device"
                 detail = f"Connected · {status}"
+                port_name = "USB"
                 product_match = re.match(
                     r"^(USB\\VID_[^&\\]+&PID_[^&\\]+)",
                     instance_id,
@@ -331,12 +427,17 @@ class HostTopologyCollector:
                     instance_id,
                     flags=re.IGNORECASE,
                 ).casefold()
-            key = container_id
+            key = (
+                f"port:{port_name.casefold()}"
+                if device_class == "ports"
+                else container_id
+            )
             candidate = AttachedDevice(
                 instance_id=instance_id,
                 label=label,
                 kind=kind,
                 detail=detail,
+                port_name=port_name,
             )
             current = devices.get(key)
             rank = 2 if device_class == "wpd" else 1
@@ -345,18 +446,21 @@ class HostTopologyCollector:
         return tuple(devices[key][1] for key in sorted(devices))
 
     @staticmethod
-    def _local_addresses(warnings: list[str]) -> tuple[str, ...]:
+    def _active_interfaces(
+        warnings: list[str],
+    ) -> tuple[NetworkInterface, ...]:
         try:
             interfaces = psutil.net_if_addrs()
             interface_status = psutil.net_if_stats()
         except OSError as exc:
             warnings.append(f"Local interface addresses unavailable: {exc}")
             return ()
-        values: set[str] = set()
+        active_interfaces: list[NetworkInterface] = []
         for interface, interface_addresses in interfaces.items():
             status = interface_status.get(interface)
             if status is None or not status.isup:
                 continue
+            values: set[str] = set()
             for item in interface_addresses:
                 if item.family not in (socket.AF_INET, socket.AF_INET6):
                     continue
@@ -371,7 +475,29 @@ class HostTopologyCollector:
                     and not parsed.is_link_local
                 ):
                     values.add(str(parsed))
-        return tuple(sorted(values, key=lambda value: (":" in value, value)))
+            if values:
+                active_interfaces.append(
+                    NetworkInterface(
+                        name=interface,
+                        addresses=tuple(
+                            sorted(values, key=lambda value: (":" in value, value))
+                        ),
+                    )
+                )
+        return tuple(sorted(active_interfaces, key=lambda item: item.name.casefold()))
+
+    @staticmethod
+    def _local_addresses(warnings: list[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    address
+                    for interface in HostTopologyCollector._active_interfaces(warnings)
+                    for address in interface.addresses
+                },
+                key=lambda value: (":" in value, value),
+            )
+        )
 
     @staticmethod
     def _active_endpoints(warnings: list[str]) -> tuple[ActiveEndpoint, ...]:
@@ -442,9 +568,12 @@ class HostTopologyCollector:
         )
 
     @staticmethod
-    def _default_gateways(warnings: list[str]) -> tuple[str, ...]:
+    def _active_default_route(
+        warnings: list[str],
+        active_addresses: tuple[str, ...] | None = None,
+    ) -> tuple[str, str] | None:
         if os.name != "nt":
-            return ()
+            return None
         try:
             result = subprocess.run(
                 ["route.exe", "print", "-4"],
@@ -457,13 +586,17 @@ class HostTopologyCollector:
             )
         except OSError as exc:
             warnings.append(f"Active default route unavailable: {exc}")
-            return ()
+            return None
         except subprocess.SubprocessError as exc:
             warnings.append(f"Active default route unavailable: {exc}")
-            return ()
+            return None
 
-        active_interfaces = set(HostTopologyCollector._local_addresses(warnings))
-        candidates: list[tuple[int, str]] = []
+        active_interfaces = set(
+            active_addresses
+            if active_addresses is not None
+            else HostTopologyCollector._local_addresses(warnings)
+        )
+        candidates: list[tuple[int, str, str]] = []
         for line in result.stdout.splitlines():
             if "persistent routes" in line.casefold():
                 break
@@ -482,10 +615,16 @@ class HostTopologyCollector:
                 and not gateway_address.is_loopback
                 and interface in active_interfaces
             ):
-                candidates.append((metric, str(gateway_address)))
+                candidates.append((metric, str(gateway_address), interface))
         if not candidates:
-            return ()
-        return (min(candidates)[1],)
+            return None
+        _, gateway, interface = min(candidates)
+        return gateway, interface
+
+    @staticmethod
+    def _default_gateways(warnings: list[str]) -> tuple[str, ...]:
+        route = HostTopologyCollector._active_default_route(warnings)
+        return (route[0],) if route is not None else ()
 
     @staticmethod
     def _removable_storage(warnings: list[str]) -> tuple[RemovableStorage, ...]:

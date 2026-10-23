@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QGridLayout, QMessageBox
+from PySide6.QtWidgets import QGridLayout, QLabel, QMessageBox
 
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
@@ -980,6 +980,27 @@ def test_dashboard_keeps_reference_column_composition_when_window_resizes(qtbot,
     dashboard = window._pages["dashboard"]
     grid = dashboard.layout().itemAt(1).layout()
     assert isinstance(grid, QGridLayout)
+
+    collector_layout = dashboard.collector_status.layout()
+    assert isinstance(collector_layout, QGridLayout)
+    for index, card in enumerate(
+        (
+            dashboard.camera_card,
+            dashboard.process_card,
+            dashboard.windows_card,
+            dashboard.voice_card,
+        )
+    ):
+        row, column, row_span, column_span = collector_layout.getItemPosition(
+            collector_layout.indexOf(card)
+        )
+        assert (row, column, row_span, column_span) == (
+            index // 2,
+            index % 2,
+            1,
+            1,
+        )
+        assert card.findChild(QLabel, "cardBody").wordWrap()
 
     for index, card in enumerate(dashboard.metric_cards):
         row, column, row_span, column_span = grid.getItemPosition(grid.indexOf(card))

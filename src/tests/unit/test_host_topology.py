@@ -131,7 +131,12 @@ def test_attached_device_inventory_classifies_usb_serial_and_display(monkeypatch
         ("display", "DisplayPort"),
         ("usb", "2.4G Mouse"),
         ("usb", "Nokia C30"),
+        ("serial", "COM4"),
     ]
+    assert devices[0].port_name == "DisplayPort"
+    assert devices[1].port_name == "USB"
+    assert devices[2].port_name == "USB"
+    assert devices[3].port_name == "COM4"
     assert "serial COM4" in devices[1].detail
     assert "Connected · Error" in devices[2].detail
     assert (
@@ -166,6 +171,11 @@ def test_default_gateway_uses_only_the_active_route(monkeypatch):
     monkeypatch.setattr(host_topology.subprocess, "run", run)
     warnings = []
 
+    route = HostTopologyCollector._active_default_route(
+        warnings,
+        ("192.168.4.105",),
+    )
+    assert route == ("192.168.4.1", "192.168.4.105")
     gateways = HostTopologyCollector._default_gateways(warnings)
     assert gateways == ("192.168.4.1",)
     assert gateways == ("192.168.4.1",)
@@ -202,3 +212,35 @@ def test_local_addresses_include_only_up_non_link_local_interfaces(monkeypatch):
 
     assert addresses == ("192.168.4.105",)
     assert not warnings
+
+
+def test_active_interfaces_keep_interface_names_and_separate_virtual_adapters(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        psutil,
+        "net_if_addrs",
+        lambda: {
+            "Wi-Fi": [
+                SimpleNamespace(family=socket.AF_INET, address="192.168.4.105"),
+            ],
+            "VMware Adapter": [
+                SimpleNamespace(family=socket.AF_INET, address="172.16.1.1"),
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        psutil,
+        "net_if_stats",
+        lambda: {
+            "Wi-Fi": SimpleNamespace(isup=True),
+            "VMware Adapter": SimpleNamespace(isup=True),
+        },
+    )
+
+    interfaces = HostTopologyCollector._active_interfaces([])
+
+    assert [(interface.name, interface.addresses) for interface in interfaces] == [
+        ("VMware Adapter", ("172.16.1.1",)),
+        ("Wi-Fi", ("192.168.4.105",)),
+    ]

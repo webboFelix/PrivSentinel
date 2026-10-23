@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.endpoint.host_topology import HostTopology
+from src.endpoint.host_topology import HostTopology, PhysicalPort
 from src.ui.icon_assets import icon_path
 
 
@@ -33,6 +33,8 @@ class _TopologyNode:
     kind: str
     address: str = ""
     detail: str = ""
+    other_addresses: tuple[str, ...] = ()
+    port_name: str = ""
 
 
 class _TopologyCanvas(QWidget):
@@ -47,9 +49,11 @@ class _TopologyCanvas(QWidget):
         self._node_positions: dict[str, QPointF] = {}
         self._node_pixmaps = {
             "computer": QIcon(icon_path("security_appliance.png")).pixmap(32, 32),
+            "gateway": QIcon(icon_path("router.png")).pixmap(30, 30),
             "usb": QIcon(icon_path("usb_drive.png")).pixmap(26, 26),
             "serial": QIcon(icon_path("network-nodes.png")).pixmap(26, 26),
             "display": QIcon(icon_path("security_appliance.png")).pixmap(26, 26),
+            "bluetooth": QIcon(icon_path("network-nodes.png")).pixmap(26, 26),
         }
         self._phase = 0.0
         self._animation = QTimer(self)
@@ -146,7 +150,7 @@ class _TopologyCanvas(QWidget):
         position: QPointF,
     ) -> None:
 
-        size = 32 if node.kind == "computer" else 26
+        size = 32 if node.kind == "computer" else 30 if node.kind == "gateway" else 26
         painter.setPen(QPen(QColor("#77d9ff"), 2 if node.key == self.selected_key else 1))
         painter.setBrush(QColor("#0a2c4c"))
         painter.drawEllipse(position, size / 2 + 5, size / 2 + 5)
@@ -213,6 +217,15 @@ class ThreatLandscapeWidget(QFrame):
         self.setObjectName("panel")
         self._nodes: tuple[_TopologyNode, ...] = ()
         self._node_by_key: dict[str, _TopologyNode] = {}
+        self._physical_ports: tuple[PhysicalPort, ...] = ()
+        self._topology = HostTopology(
+            hostname="",
+            local_addresses=(),
+            gateways=(),
+            endpoints=(),
+            removable_storage=(),
+            warnings=(),
+        )
         self._active_alert: Mapping[str, object] | None = None
         self._potential_finding: Mapping[str, object] | None = None
         self._selected_key = "computer"
@@ -270,7 +283,7 @@ class ThreatLandscapeWidget(QFrame):
 
         self.details = QFrame()
         self.details.setObjectName("threatDetails")
-        self.details.setMinimumWidth(165)
+        self.details.setMinimumWidth(190)
         self.details.setMaximumWidth(230)
         detail_layout = QVBoxLayout(self.details)
         detail_layout.setContentsMargins(10, 8, 10, 8)
@@ -304,7 +317,15 @@ class ThreatLandscapeWidget(QFrame):
         self.values: dict[str, QLabel] = {}
         self._field_rows: dict[str, tuple[QLabel, QLabel]] = {}
         for row, name in enumerate(
-            ("Process", "Source", "IP address", "Connection", "Details")
+            (
+                "Process",
+                "Source",
+                "IP address",
+                "Connection",
+                "Other local IPs",
+                "Ports",
+                "Details",
+            )
         ):
             label = QLabel(name)
             label.setObjectName("muted")
@@ -347,11 +368,17 @@ class ThreatLandscapeWidget(QFrame):
         active_alert: Mapping[str, object] | None,
         potential_finding: Mapping[str, object] | None,
     ) -> None:
+        self._topology = topology
         self._active_alert = active_alert
         self._potential_finding = potential_finding
         self.topology_status.setStyleSheet("")
         self._nodes = _topology_nodes(topology)
         self._node_by_key = {node.key: node for node in self._nodes}
+        self._physical_ports = topology.physical_ports or tuple(
+            PhysicalPort(device.port_name, device.label, device.detail)
+            for device in topology.attached_devices
+            if device.port_name
+        )
         if self._selected_key not in self._node_by_key:
             self._selected_key = "computer"
         self.canvas.set_topology(
@@ -366,10 +393,23 @@ class ThreatLandscapeWidget(QFrame):
         self.node_selector.setCurrentIndex(max(0, selected_index))
         self.node_selector.blockSignals(False)
         device_count = sum(
-            node.kind in {"usb", "serial", "display"} for node in self._nodes
+            node.kind in {"usb", "serial", "display", "bluetooth"}
+            for node in self._nodes
         )
+        port_count = len(self._physical_ports)
+        primary_address = topology.primary_address or self._node_by_key[
+            "computer"
+        ].address
+        gateway_node = next(
+            (node for node in self._nodes if node.kind == "gateway"),
+            None,
+        )
+        gateway = gateway_node.address if gateway_node else "unavailable"
         suffix = "; ".join(topology.warnings)
-        summary = f"This device · {device_count} connected device(s)"
+        summary = (
+            f"Host {primary_address or 'IP unavailable'} · Gateway {gateway} · "
+            f"{device_count} device(s) / {port_count} port(s)"
+        )
         if suffix:
             summary += " · Inventory partial"
         self.topology_status.setText(summary)
@@ -403,10 +443,14 @@ class ThreatLandscapeWidget(QFrame):
         node = self._node_by_key.get(self._selected_key)
         if node is None:
             return
-        alert = self._active_alert
+        alert = (
+            self._active_alert
+            if node.kind == "computer"
+            else None
+        )
         attributes = alert.get("attributes", {}) if alert else {}
         attributes = attributes if isinstance(attributes, Mapping) else {}
-        finding = self._potential_finding
+        finding = self._potential_finding if node.kind == "computer" else None
         if alert is not None:
             title = str(alert.get("title") or "Active alert")
             severity = str(alert.get("severity") or "unknown").upper()
@@ -428,6 +472,8 @@ class ThreatLandscapeWidget(QFrame):
                 or "—"
             )
             details = str(alert.get("rationale") or node.detail or "—")
+            other_local_ips = ""
+            ports = node.port_name
             self.severity_badge.setText(severity)
         elif finding is not None:
             title = f"Potential {finding.get('provider', 'malware')} match"
@@ -441,6 +487,8 @@ class ThreatLandscapeWidget(QFrame):
                 f"{finding.get('sha256', 'unavailable')} · review required; "
                 "a rule match is not a confirmed malware verdict"
             )
+            other_local_ips = ""
+            ports = node.port_name
             self.severity_badge.setText(severity)
         else:
             title = node.label
@@ -458,9 +506,20 @@ class ThreatLandscapeWidget(QFrame):
                 ip_address = "No IP assigned over USB"
             elif node.kind in {"serial", "display"}:
                 ip_address = "No network IP assigned"
+            elif node.kind == "bluetooth":
+                ip_address = "No IP address assigned over Bluetooth"
             else:
                 ip_address = "—"
             details = node.detail if node.kind != "computer" else "—"
+            other_local_ips = "; ".join(node.other_addresses) or "—"
+            ports = (
+                "; ".join(
+                    f"{port.name}: {port.device} ({port.status})"
+                    for port in self._physical_ports
+                )
+                if node.kind == "computer" and self._physical_ports
+                else node.port_name
+            )
             self.severity_badge.setText("NO ALERT")
         self.threat_title.setText(title)
         self.details.setToolTip(title)
@@ -468,12 +527,16 @@ class ThreatLandscapeWidget(QFrame):
         self.values["Source"].setText(source)
         self.values["IP address"].setText(ip_address)
         self.values["Connection"].setText(connection_text)
+        self.values["Other local IPs"].setText(other_local_ips or "—")
+        self.values["Ports"].setText(ports or "—")
         self.values["Details"].setText(details[:180])
         visible_values = {
             "Process": process,
             "Source": source,
             "IP address": ip_address,
             "Connection": connection_text,
+            "Other local IPs": other_local_ips,
+            "Ports": ports,
             "Details": details if details != connection_text else "",
         }
         for name, (label_widget, value_widget) in self._field_rows.items():
@@ -537,22 +600,75 @@ class ThreatLandscapeWidget(QFrame):
 
 
 def _topology_nodes(topology: HostTopology) -> tuple[_TopologyNode, ...]:
-    address_summary = ", ".join(topology.local_addresses)
+    usable_addresses = tuple(
+        address
+        for address in topology.local_addresses
+        if not ipaddress.ip_address(address).is_link_local
+    )
+    primary_address = topology.primary_address or (
+        usable_addresses[0]
+        if usable_addresses
+        else topology.local_addresses[0]
+        if topology.local_addresses
+        else ""
+    )
+    other_addresses = tuple(
+        f"{interface.name}: {address}"
+        for interface in topology.network_interfaces
+        for address in interface.addresses
+        if address != primary_address
+        and not ipaddress.ip_address(address).is_link_local
+    )
+    if not topology.network_interfaces:
+        other_addresses = tuple(
+            address
+            for address in topology.local_addresses
+            if address != primary_address
+            and not ipaddress.ip_address(address).is_link_local
+        )
+    usable_gateways = []
+    for address in topology.gateways:
+        parsed = ipaddress.ip_address(address)
+        if not parsed.is_link_local and not parsed.is_unspecified:
+            usable_gateways.append(address)
+    gateway = next(
+        (address for address in usable_gateways if ipaddress.ip_address(address).version == 4),
+        usable_gateways[0] if usable_gateways else "",
+    )
+    host_detail = (
+        f"{topology.primary_interface} · default route via {gateway}"
+        if topology.primary_interface and gateway
+        else f"Default gateway {gateway}"
+        if gateway
+        else topology.primary_interface or "Local interface"
+    )
     nodes = [
         _TopologyNode(
             "computer",
             "This device",
             "computer",
-            address=address_summary,
-            detail="Local interfaces",
+            address=primary_address,
+            detail=host_detail,
+            other_addresses=other_addresses,
         ),
     ]
+    if gateway:
+        nodes.append(
+            _TopologyNode(
+                f"gateway:{gateway}",
+                "Gateway",
+                "gateway",
+                address=gateway,
+                detail="Active default gateway",
+            )
+        )
     nodes.extend(
         _TopologyNode(
             f"device:{device.instance_id}",
             _device_display_label(device.label, device.kind),
             device.kind,
             detail=device.detail,
+            port_name=device.port_name,
         )
         for device in topology.attached_devices
     )
@@ -581,6 +697,10 @@ def _device_display_label(label: str, kind: str) -> str:
         if "hdmi" in normalized:
             return "HDMI"
         return "Display"
+    if kind == "serial":
+        return label
+    if kind == "bluetooth":
+        return label
     if "mouse" in normalized or "pointing" in normalized:
         return label
     if any(phone in normalized for phone in ("android", "nokia", "phone", "mtp")):

@@ -492,6 +492,7 @@ class MainWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.stop()
             self.topbar.set_voice_search_active(False)
+            self._set_voice_assistant_card(False)
             return
 
         settings = QSettings("PrivSentinel", "PrivSentinel")
@@ -516,6 +517,7 @@ class MainWindow(QMainWindow):
             lambda worker=worker: self._voice_search_finished(worker)
         )
         self.topbar.set_voice_search_active(True)
+        self._set_voice_assistant_card(True)
         worker.start()
 
     def _on_voice_search_recognized(self, phrase: str) -> None:
@@ -526,8 +528,19 @@ class MainWindow(QMainWindow):
         if self._voice_search_worker is worker:
             self._voice_search_worker = None
             self.topbar.set_voice_search_active(False)
+            self._set_voice_assistant_card(False)
+
+    def _set_voice_assistant_card(self, active: bool) -> None:
+        dashboard = self._pages.get("dashboard")
+        set_active = getattr(dashboard, "set_voice_assistant_active", None)
+        if callable(set_active):
+            set_active(active)
 
     def _handle_page_action(self, action: str) -> None:
+
+        if action == "voice-search":
+            self._toggle_voice_search()
+            return
 
         if action in {"identity-protection", "identity-enrollment", "enrollment"}:
             model_preparation_active = (
