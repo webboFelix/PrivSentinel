@@ -36,21 +36,37 @@ class MonitoringWorker(QThread):
 
     def run(self) -> None:
         self.stateChanged.emit("starting")
-        while not self._stop_event.is_set():
-            started = time.monotonic()
-            try:
-                for event in self.collector.collect():
-                    if isinstance(event, SecurityEvent):
-                        self.eventObserved.emit(event)
-                    else:
-                        raise TypeError(
-                            f"{self.source_name} collector returned a non-event value."
-                        )
-                self.last_successful_collection_at = time.monotonic()
-                self.stateChanged.emit("running")
-            except Exception as exc:  # noqa: BLE001 - report collector failures to the UI
-                self.errorRaised.emit(f"{self.source_name}: {exc}")
-                self.stateChanged.emit("error")
-            elapsed = time.monotonic() - started
-            self._stop_event.wait(max(0, self.interval_seconds - elapsed))
+        start = getattr(self.collector, "start", None)
+        stop = getattr(self.collector, "stop", None)
+        try:
+            if start is not None:
+                start()
+        except Exception as exc:  # noqa: BLE001 - report collector startup failures
+            self.errorRaised.emit(f"{self.source_name}: {exc}")
+            self.stateChanged.emit("error")
+            return
+        try:
+            while not self._stop_event.is_set():
+                started = time.monotonic()
+                try:
+                    for event in self.collector.collect():
+                        if isinstance(event, SecurityEvent):
+                            self.eventObserved.emit(event)
+                        else:
+                            raise TypeError(
+                                f"{self.source_name} collector returned a non-event value."
+                            )
+                    self.last_successful_collection_at = time.monotonic()
+                    self.stateChanged.emit("running")
+                except Exception as exc:  # noqa: BLE001 - report collector failures
+                    self.errorRaised.emit(f"{self.source_name}: {exc}")
+                    self.stateChanged.emit("error")
+                elapsed = time.monotonic() - started
+                self._stop_event.wait(max(0, self.interval_seconds - elapsed))
+        finally:
+            if stop is not None:
+                try:
+                    stop()
+                except Exception as exc:  # noqa: BLE001 - report collector cleanup failures
+                    self.errorRaised.emit(f"{self.source_name} shutdown: {exc}")
         self.stateChanged.emit("stopped")

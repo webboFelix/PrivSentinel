@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QGridLayout, QLabel, QMessageBox
+from PySide6.QtWidgets import QCheckBox, QGridLayout, QLabel, QMessageBox
 
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
@@ -106,7 +106,9 @@ def test_global_search_includes_local_events_and_files(qtbot, monkeypatch, windo
     monkeypatch.setattr("src.ui.main_window.SearchResultsDialog", SearchDialog)
     window._search_pages("needle")
 
-    assert any("EVENT" in record[0] and "needle event" in record[0] for record in captured["records"])
+    assert any(
+        "EVENT" in record[0] and "needle event" in record[0] for record in captured["records"]
+    )
     assert any("FILE" in record[0] and "needle.txt" in record[0] for record in captured["records"])
 
 
@@ -181,11 +183,14 @@ def test_topbar_and_sidebar_show_unreviewed_alert_count(window, monkeypatch):
 
     assert window.topbar.alert_count.isHidden()
     assert all(badge.isHidden() for badge in window.sidebar._alert_badges.values())
-    assert next(
-        alert
-        for alert in window.services.security_repository.list_alerts(limit=10)
-        if alert["id"] == "alert-0"
-    )["status"] == "acknowledged"
+    assert (
+        next(
+            alert
+            for alert in window.services.security_repository.list_alerts(limit=10)
+            if alert["id"] == "alert-0"
+        )["status"]
+        == "acknowledged"
+    )
 
 
 def test_lock_warning_cannot_be_cancelled_and_closes_when_identity_is_verified(window):
@@ -392,19 +397,14 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
 
     assert score_card.ring._score == 86
     assert score_card.risk_label.text() == "HEALTHY · MAINTAIN PROTECTION"
-    assert {
-        name: progress.value()
-        for name, progress in score_card.factor_progress.items()
-    } == {
+    assert {name: progress.value() for name, progress in score_card.factor_progress.items()} == {
         "Identity": 80,
         "Files": 92,
         "Processes": 50,
         "Network": 60,
         "Windows": 0,
     }
-    assert {
-        name: label.text() for name, label in score_card.factor_values.items()
-    } == {
+    assert {name: label.text() for name, label in score_card.factor_values.items()} == {
         "Identity": "80%",
         "Files": "92%",
         "Processes": "Active",
@@ -428,9 +428,7 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
     assert score_card.ring._score == 86
     assert score_card.risk_label.text() == "HEALTHY · MAINTAIN PROTECTION"
     assert score_card.ring._color.name() == "#18d89b"
-    assert {
-        name: label.text() for name, label in score_card.factor_values.items()
-    } == {
+    assert {name: label.text() for name, label in score_card.factor_values.items()} == {
         "Identity": "80%",
         "Files": "92%",
         "Processes": "Inactive",
@@ -518,13 +516,9 @@ def test_dashboard_ratios_require_a_real_denominator():
     assert _ratio_percent(8, 5) == 100
 
 
-def test_dashboard_activity_tables_use_network_events_and_live_process_metrics(
-    window, monkeypatch
-):
+def test_dashboard_activity_tables_use_network_events_and_live_process_metrics(window, monkeypatch):
     dashboard = window._pages["dashboard"]
-    window.services.settings = replace(
-        window.services.settings, process_monitoring_enabled=True
-    )
+    window.services.settings = replace(window.services.settings, process_monitoring_enabled=True)
     window.services.event_pipeline.publish(
         SecurityEvent(
             source="network",
@@ -552,9 +546,7 @@ def test_dashboard_activity_tables_use_network_events_and_live_process_metrics(
     monkeypatch.setattr(
         dashboard._process_snapshot,
         "snapshot",
-        lambda limit: [
-            ProcessSnapshot(321, "example.exe", 12.5, 44 * 1024 * 1024)
-        ],
+        lambda limit: [ProcessSnapshot(321, "example.exe", 12.5, 44 * 1024 * 1024)],
     )
 
     dashboard.refresh_security_data()
@@ -577,15 +569,12 @@ def test_dashboard_activity_tables_use_network_events_and_live_process_metrics(
 
 def test_network_monitor_reads_persisted_local_events(window, monkeypatch):
     page = window._pages["network-monitor"]
-    window.services.settings = replace(
-        window.services.settings, network_monitoring_enabled=True
-    )
+    window.services.settings = replace(window.services.settings, network_monitoring_enabled=True)
+
     def no_reverse_dns(_address):
         raise socket.herror("No PTR record")
 
-    monkeypatch.setattr(
-        "src.ui.pages.endpoint_data.socket.gethostbyaddr", no_reverse_dns
-    )
+    monkeypatch.setattr("src.ui.pages.endpoint_data.socket.gethostbyaddr", no_reverse_dns)
     window.services.event_pipeline.publish(
         SecurityEvent(
             source="network",
@@ -618,9 +607,7 @@ def test_network_monitor_resolves_reverse_and_forward_dns_without_blocking(
     qtbot, window, monkeypatch
 ):
     page = window._pages["network-monitor"]
-    window.services.settings = replace(
-        window.services.settings, network_monitoring_enabled=True
-    )
+    window.services.settings = replace(window.services.settings, network_monitoring_enabled=True)
     address = "8.8.8.8"
     monkeypatch.setattr(
         "src.ui.pages.endpoint_data.socket.gethostbyaddr",
@@ -628,9 +615,7 @@ def test_network_monitor_resolves_reverse_and_forward_dns_without_blocking(
     )
     monkeypatch.setattr(
         "src.ui.pages.endpoint_data.socket.getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (2, 1, 6, "", (address, 0))
-        ],
+        lambda *_args, **_kwargs: [(2, 1, 6, "", (address, 0))],
     )
     window.services.event_pipeline.publish(
         SecurityEvent(
@@ -651,9 +636,7 @@ def test_network_monitor_resolves_reverse_and_forward_dns_without_blocking(
     assert page.table.rows[0][1] == address
 
 
-def test_network_monitor_supports_manual_forward_domain_lookup(
-    qtbot, window, monkeypatch
-):
+def test_network_monitor_supports_manual_forward_domain_lookup(qtbot, window, monkeypatch):
     page = window._pages["network-monitor"]
     monkeypatch.setattr(
         "src.ui.pages.endpoint_data.QInputDialog.getText",
@@ -674,8 +657,7 @@ def test_network_monitor_supports_manual_forward_domain_lookup(
 
     page._lookup_domain()
     qtbot.waitUntil(
-        lambda: page.source_status.text_label.text()
-        == "Domain lookup complete: example.test",
+        lambda: page.source_status.text_label.text() == "Domain lookup complete: example.test",
         timeout=5_000,
     )
 
@@ -741,28 +723,20 @@ def test_threat_intelligence_page_matches_analyst_managed_local_iocs(window):
 
 def test_process_monitor_page_shows_live_process_snapshot(window, monkeypatch):
     page = window._pages["process-monitor"]
-    window.services.settings = replace(
-        window.services.settings, process_monitoring_enabled=True
-    )
+    window.services.settings = replace(window.services.settings, process_monitoring_enabled=True)
     monkeypatch.setattr(
         page._process_snapshot,
         "snapshot",
-        lambda limit: [
-            ProcessSnapshot(321, "example.exe", 12.5, 44 * 1024 * 1024, "local-user")
-        ],
+        lambda limit: [ProcessSnapshot(321, "example.exe", 12.5, 44 * 1024 * 1024, "local-user")],
     )
 
     page.refresh_data()
 
-    assert page.table.rows == (
-        ("example.exe", "321", "local-user", "12.5%", "44.0 MB", "—"),
-    )
+    assert page.table.rows == (("example.exe", "321", "local-user", "12.5%", "44.0 MB", "—"),)
     assert "risk not assessed" in page.source_status.text_label.text()
 
 
-def test_file_integrity_page_creates_baseline_and_syncs_configuration(
-    qtbot, window, tmp_path
-):
+def test_file_integrity_page_creates_baseline_and_syncs_configuration(qtbot, window, tmp_path):
     window.show()
     page = window._pages["file-integrity"]
     watched = tmp_path / "watched"
@@ -775,11 +749,9 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(
     qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
 
     assert window.services.settings.file_integrity_roots == (str(watched),)
-    assert len(page.table.rows) == 1
-    assert page.table.rows[0][0] == str(tracked_file)
-    assert page.table.rows[0][1] == "Baseline"
-    assert page.table.rows[0][3] == "Unchanged"
-    assert "1 baseline files" in page.status.text_label.text()
+    assert page.table.rows == ()
+    assert "Trusted baseline created" in page.status.text_label.text()
+    assert str(window.services.paths.database_file) in page.status.text_label.text()
 
     window.services.event_pipeline.publish(
         SecurityEvent(
@@ -792,16 +764,95 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(
     )
     page.refresh_data()
 
-    assert page.table.rows[0][1] == "File Changed"
-    assert page.table.rows[0][3] == "Medium"
+    assert page.table.rows[0][1].splitlines()[0] == "tracked.txt"
+    assert page.table.rows[0][2] == "Modified"
+    assert page.table.rows[0][3] == "Review Required"
     window.navigate_to("settings")
     settings = window._pages["settings"]
     assert settings.file_integrity_roots.toPlainText() == str(watched)
 
 
-def test_file_integrity_page_surfaces_baseline_creation_failure(
-    qtbot, window, tmp_path
-):
+def test_file_integrity_reference_dashboard_tabs_and_auto_update_setting(qtbot, window, tmp_path):
+    page = window._pages["file-integrity"]
+
+    assert [page.tabs.tabText(index) for index in range(page.tabs.count())] == [
+        "Overview",
+        "Event History",
+        "Baseline",
+        "Settings",
+    ]
+    assert page.tabs.currentIndex() == 2
+    assert page.tab_pages.currentIndex() == 0
+    assert page.minimumSizeHint().width() <= 906
+
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    page.roots.setPlainText(str(watched))
+    page._save_configuration()
+    folder_row = page.settings_folder_layout.itemAt(0).widget()
+    folder_option = folder_row.findChild(QCheckBox)
+    assert isinstance(folder_option, QCheckBox)
+    assert folder_option.isChecked()
+    folder_option.setChecked(False)
+    assert window.services.settings.file_integrity_roots == ()
+
+    page.view_all_events_button.click()
+    assert page.tabs.currentIndex() == 1
+    assert page.tab_pages.currentIndex() == 1
+
+    page.automatic_updates.setChecked(False)
+    assert window.services.settings.file_integrity_auto_update_enabled is False
+    assert not page.update_frequency.isEnabled()
+    page.automatic_updates.setChecked(True)
+    assert window.services.settings.file_integrity_auto_update_enabled is True
+    assert page.update_frequency.isEnabled()
+
+
+def test_file_integrity_baseline_is_created_once_across_app_launches(qtbot, tmp_path):
+    paths = AppPaths(tmp_path / "local")
+    watched = tmp_path / "watched-on-launch"
+    watched.mkdir()
+    tracked = watched / "tracked.txt"
+    tracked.write_text("trusted at first launch", encoding="utf-8")
+    services = ApplicationServices.create(paths)
+    roots = (str(watched),)
+    services.save_settings(
+        replace(
+            services.settings,
+            file_integrity_roots=roots,
+            file_integrity_monitoring_enabled=True,
+        )
+    )
+    first_window = MainWindow(services)
+    qtbot.addWidget(first_window)
+    first_page = first_window._pages["file-integrity"]
+    qtbot.waitUntil(lambda: first_page._baseline_worker is None, timeout=10_000)
+    assert str(services.paths.database_file) in first_window.statusBar().currentMessage()
+    assert first_window.file_integrity_progress.isHidden()
+    trusted_hash = services.database.fetchone(
+        "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+        (str(tracked.resolve()),),
+    )["sha256"]
+    assert services.endpoint_service.has_file_baseline(roots)
+    first_window.close()
+
+    tracked.write_text("changed after baseline", encoding="utf-8")
+    restarted_services = ApplicationServices.create(paths)
+    restarted_window = MainWindow(restarted_services)
+    qtbot.addWidget(restarted_window)
+    restarted_page = restarted_window._pages["file-integrity"]
+    assert restarted_page._baseline_worker is None
+    assert (
+        restarted_services.database.fetchone(
+            "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+            (str(tracked.resolve()),),
+        )["sha256"]
+        == trusted_hash
+    )
+    restarted_window.close()
+
+
+def test_file_integrity_page_surfaces_baseline_creation_failure(qtbot, window, tmp_path):
     page = window._pages["file-integrity"]
     missing = tmp_path / "missing-baseline-root"
     page.roots.setPlainText(str(missing))
@@ -816,6 +867,11 @@ def test_file_integrity_page_surfaces_baseline_creation_failure(
 
 def test_settings_create_baseline_button_starts_baseline(qtbot, window, tmp_path):
     settings_page = window._pages["settings"]
+    file_page = window._pages["file-integrity"]
+    progress_updates = []
+    file_page.baselineProgressChanged.connect(
+        lambda processed, total: progress_updates.append((processed, total))
+    )
     watched = tmp_path / "baseline-from-settings"
     watched.mkdir()
     (watched / "tracked.txt").write_text("baseline", encoding="utf-8")
@@ -827,7 +883,14 @@ def test_settings_create_baseline_button_starts_baseline(qtbot, window, tmp_path
     qtbot.waitUntil(lambda: file_page._baseline_worker is None, timeout=10_000)
 
     assert window.services.endpoint_service.has_file_baseline((str(watched),), ())
-    assert "1 baseline files" in file_page.status.text_label.text()
+    assert "Trusted baseline created" in file_page.status.text_label.text()
+    assert str(window.services.paths.database_file) in file_page.status.text_label.text()
+    assert (-1, -1) in progress_updates
+    assert (0, 1) in progress_updates
+    assert (1, 1) in progress_updates
+    assert not settings_page.file_integrity_monitoring.isChecked()
+    assert window.file_integrity_progress.isHidden()
+    assert str(window.services.paths.database_file) in window.statusBar().currentMessage()
 
 
 def test_settings_save_persists_other_preferences_before_baseline_setup(
@@ -859,15 +922,38 @@ def test_settings_save_persists_other_preferences_before_baseline_setup(
     assert window.services.endpoint_service.has_file_baseline((str(watched),), ())
     assert file_page.roots.toPlainText() == str(watched)
     assert file_page.enabled.isChecked()
+    assert "monitoring enabled" in settings_page.status.text_label.text()
+    assert str(window.services.paths.database_file) in settings_page.status.text_label.text()
+
+
+def test_settings_reports_baseline_failure_and_keeps_monitoring_disabled(
+    qtbot, window, tmp_path, monkeypatch
+):
+    settings_page = window._pages["settings"]
+    missing = tmp_path / "missing-file-integrity-root"
+    settings_page.file_integrity_roots.setPlainText(str(missing))
+    settings_page.file_integrity_monitoring.setChecked(True)
+    monkeypatch.setattr(
+        settings_page,
+        "_warn_missing_baseline",
+        settings_page._open_file_integrity_page,
+    )
+
+    settings_page._save()
+    file_page = window._pages["file-integrity"]
+    qtbot.waitUntil(lambda: file_page._baseline_worker is None, timeout=10_000)
+
+    assert not window.services.settings.file_integrity_monitoring_enabled
+    assert not settings_page.file_integrity_monitoring.isChecked()
+    assert "Could not enable file-integrity monitoring" in settings_page.status.text_label.text()
+    assert "root is unavailable" in settings_page.status.text_label.text()
 
 
 def test_empty_directory_baseline_is_shown_as_current(window, tmp_path):
     watched = tmp_path / "empty-watched-folder"
     watched.mkdir()
     roots = (str(watched),)
-    window.services.save_settings(
-        replace(window.services.settings, file_integrity_roots=roots)
-    )
+    window.services.save_settings(replace(window.services.settings, file_integrity_roots=roots))
     window.services.endpoint_service.establish_file_baseline(roots)
 
     page = window._pages["file-integrity"]
@@ -877,9 +963,7 @@ def test_empty_directory_baseline_is_shown_as_current(window, tmp_path):
     assert "baseline needs refresh" not in page.status.text_label.text()
 
 
-def test_dashboard_activity_columns_are_visible_and_aligned(
-    qtbot, tmp_path, monkeypatch
-):
+def test_dashboard_activity_columns_are_visible_and_aligned(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(
         DashboardPage,
         "refresh_host_topology",
@@ -932,7 +1016,9 @@ def test_dashboard_activity_columns_are_visible_and_aligned(
             for index in range(table.columnCount())
         ]
         assert sections == sorted(sections)
-        assert all(table.horizontalHeader().sectionSize(index) > 0 for index in range(table.columnCount()))
+        assert all(
+            table.horizontalHeader().sectionSize(index) > 0 for index in range(table.columnCount())
+        )
         assert all(
             table.horizontalHeader().sectionViewportPosition(index)
             + table.horizontalHeader().sectionSize(index)
@@ -940,13 +1026,11 @@ def test_dashboard_activity_columns_are_visible_and_aligned(
             for index in range(table.columnCount())
         )
     assert [
-        dashboard.network_activity.table.horizontalHeaderItem(index).text()
-        for index in range(5)
+        dashboard.network_activity.table.horizontalHeaderItem(index).text() for index in range(5)
     ] == ["Source", "Destination", "Port", "Protocol", "Risk"]
     window.close()
     assert [
-        dashboard.process_activity.table.horizontalHeaderItem(index).text()
-        for index in range(5)
+        dashboard.process_activity.table.horizontalHeaderItem(index).text() for index in range(5)
     ] == ["Process", "PID", "CPU", "Memory", "Risk"]
 
 
@@ -1102,9 +1186,7 @@ def test_declining_startup_model_download_is_remembered(qtbot, tmp_path, monkeyp
     assert not started
 
 
-def test_dashboard_monitoring_action_requests_app_camera_consent(
-    qtbot, tmp_path, monkeypatch
-):
+def test_dashboard_monitoring_action_requests_app_camera_consent(qtbot, tmp_path, monkeypatch):
     window = MainWindow(ApplicationServices.create(AppPaths(tmp_path / "local")))
     qtbot.addWidget(window)
     started = []
@@ -1127,9 +1209,7 @@ def test_dashboard_monitoring_action_requests_app_camera_consent(
     window.close()
 
 
-def test_missing_file_integrity_baseline_does_not_crash_application_startup(
-    qtbot, tmp_path
-):
+def test_missing_file_integrity_baseline_does_not_crash_application_startup(qtbot, tmp_path):
     services = ApplicationServices.create(AppPaths(tmp_path / "local"))
     services.save_settings(
         replace(

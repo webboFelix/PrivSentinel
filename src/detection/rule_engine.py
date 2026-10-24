@@ -62,6 +62,34 @@ class DetectionEngine:
                 "high",
                 "An enabled process rule matched collected process metadata",
             ),
+            DetectionRule(
+                "file-integrity.content-changed",
+                "Protected file content changed",
+                "file_changed",
+                "medium",
+                "The file SHA-256 no longer matches its trusted baseline",
+            ),
+            DetectionRule(
+                "file-integrity.file-missing",
+                "Protected file deleted",
+                "file_missing",
+                "medium",
+                "A file recorded in the trusted baseline is no longer present",
+            ),
+            DetectionRule(
+                "file-integrity.new-file",
+                "New file in protected folder",
+                "file_added",
+                "low",
+                "A file was added to a protected folder and is not yet trusted",
+            ),
+            DetectionRule(
+                "file-integrity.file-renamed",
+                "Protected file moved or renamed",
+                "file_renamed",
+                "low",
+                "A file path changed since the trusted baseline",
+            ),
         )
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):

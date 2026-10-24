@@ -4,6 +4,7 @@ QWidget {
     font-size: 10pt;
 }
 QMainWindow, QWidget#appRoot, QWidget#pageViewport { background: #06162b; }
+QWidget#page-file-integrity { background: #04162c; }
 QFrame#sidebar { background: #06172c; border-right: 1px solid #123456; }
 QFrame#topbar { background: #071a33; border-bottom: 1px solid #123456; }
 QFrame#panel, QFrame#metricCard, QFrame#statusCard {
@@ -27,6 +28,215 @@ QComboBox#chartPeriod {
     border-radius: 9px;
     padding: 3px 8px;
     font-size: 8pt;
+}
+QTabBar#fimTabs {
+    background: transparent;
+    border-bottom: 1px solid #143b61;
+}
+QTabBar#fimTabs::tab {
+    color: #8ea9c8;
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 8px 15px;
+    margin-right: 5px;
+    min-width: 72px;
+}
+QTabBar#fimTabs::tab:selected {
+    color: #e6f0ff;
+    background: #082c51;
+    border-bottom: 2px solid #00b9e8;
+    font-weight: 600;
+}
+QFrame#fimPanel {
+    background: #061c36;
+    border: 1px solid #0c4b89;
+    border-radius: 8px;
+}
+QFrame#fimMetricCard {
+    background: #051b36;
+    border: 1px solid #0a4b8d;
+    border-radius: 8px;
+}
+QLabel#fimPanelTitle { color: #e5efff; font-size: 9pt; font-weight: 700; }
+QLabel#fimPanelDescription { color: #63a6e4; font-size: 7pt; }
+QLabel#fimMetricValue { color: #e5f0ff; font-size: 15pt; font-weight: 700; }
+QLabel#fimMetricDescription { color: #00d6ba; font-size: 6.5pt; }
+QLabel#fimMetricArrow { color: #168cff; font-size: 16pt; }
+QLabel#fimFolderPath { color: #67a9e7; font-size: 7pt; }
+QLabel#fimFolderName { color: #e2edfc; font-size: 8pt; font-weight: 650; }
+QLabel#fimMonitoredPill {
+    color: #00e1bf;
+    background: #00483f;
+    border-radius: 11px;
+    padding: 3px 11px;
+    font-size: 7pt;
+}
+QLabel#fimBaselineTitle { color: #51e8ad; font-size: 9pt; font-weight: 700; }
+QLabel#fimBaselineSummary { color: #6da7df; font-size: 7pt; }
+QLabel#fimAutoTitle { color: #dceaff; font-size: 8pt; font-weight: 600; }
+QLabel#fimStepText { color: #69a5df; font-size: 7pt; }
+QLabel#fimSubheading { color: #dbeaff; font-size: 8pt; font-weight: 600; }
+QLabel#fimSettingsFolderState { color: #6da7df; font-size: 7pt; }
+QLabel#fimDivider, QFrame#fimDivider { background: #0d3458; border: 0; }
+QFrame#fimFolderRow { background: transparent; }
+QTableWidget#fimEventTable {
+    background: #041a34;
+    alternate-background-color: #061f3c;
+    color: #8eb9e5;
+    gridline-color: #0d3458;
+    font-size: 7pt;
+    selection-background-color: #0d3d68;
+}
+QTableWidget#fimEventTable QHeaderView::section {
+    color: #93bce9;
+    background: #061d38;
+    border-bottom: 1px solid #0d3458;
+    padding: 5px 4px;
+    font-size: 7pt;
+    font-weight: 600;
+}
+QTableWidget#fimEventTable::item { padding: 2px 3px; border-bottom: 1px solid #0d3458; }
+QLabel#fimEventPillNormal, QLabel#fimEventPillReview, QLabel#fimEventPillInvestigate {
+    border-radius: 10px;
+    padding: 3px 6px;
+    font-size: 6.5pt;
+}
+QLabel#fimEventPillNormal { color: #66e8c3; background: #075b50; }
+QLabel#fimEventPillReview { color: #ffdb84; background: #67420e; }
+QLabel#fimEventPillInvestigate { color: #ff8aaa; background: #791a44; }
+QPushButton#fimOutlineButton {
+    color: #b7d9fb;
+    background: #061f3d;
+    border: 1px solid #0c559a;
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 7pt;
+}
+QPushButton#fimOutlineButton:hover { background: #0b3158; border-color: #198bdf; }
+QPushButton#fimUpdateButton {
+    color: #d8eaff;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    text-align: left;
+    font-size: 8pt;
+    font-weight: 600;
+}
+QFrame#fimUpdateCard {
+    background: #06274b;
+    border: 1px solid #1164ac;
+    border-radius: 7px;
+}
+QLabel#fimUpdateSubtitle { color: #6ca9e5; font-size: 6.5pt; }
+QPushButton#fimFolderMenu {
+    color: #83b8e9;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font-size: 13pt;
+}
+QPushButton#fimFolderMenu:hover { background: #0a3159; }
+QLabel#fimBaselineState {
+    color: #f2cf71;
+    background: #342a12;
+    border: 1px solid #725d25;
+    border-radius: 6px;
+    padding: 8px;
+}
+QLabel#fimBaselineState[baselineState="ready"] {
+    color: #78d9a3;
+    background: #0d342e;
+    border-color: #1f684e;
+}
+QLabel#fimStepNumber {
+    color: #e6f0ff;
+    background: #087eaa;
+    border-radius: 11px;
+    font-weight: 700;
+}
+QLabel#fimFolderCheck { color: #38cf8a; font-weight: 700; }
+QLabel#fimFolderName { color: #d9e8f7; font-weight: 600; }
+QLabel#fimSecureNote {
+    color: #8ea9c8;
+    background: #071a33;
+    border: 1px solid #143b61;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 7pt;
+}
+QComboBox#fimUpdateFrequency {
+    font-size: 8pt;
+    padding: 5px 8px;
+}
+QWidget#fimTableHost {
+    background: transparent;
+    border: 0;
+}
+QWidget#fimTableHost QWidget#stateView {
+    background: transparent;
+    border: 0;
+}
+QWidget#fimTableHost QWidget#stateView QLabel#sectionTitle {
+    color: #a9c8e7;
+    font-size: 8pt;
+}
+QWidget#fimTableHost QWidget#stateView QLabel#muted {
+    color: #7199bf;
+    font-size: 7pt;
+}
+QPushButton#fimQuietButton {
+    color: #8ec8ef;
+    background: transparent;
+    border: 0;
+    padding: 3px 6px;
+}
+QPushButton#fimQuietButton:hover { color: #e6f0ff; background: #0c3157; }
+QPushButton#fimMoreButton {
+    color: #b4cae1;
+    background: transparent;
+    border: 1px solid #16466f;
+    padding: 1px 5px;
+    font-size: 14pt;
+}
+QCheckBox#fimSwitch { spacing: 8px; font-weight: 600; }
+QCheckBox#fimSwitch::indicator {
+    width: 36px;
+    height: 20px;
+    border-radius: 10px;
+    background: #243b56;
+    border: 1px solid #45617d;
+}
+QCheckBox#fimSwitch::indicator:checked {
+    background: #087ee5;
+    border-color: #168cff;
+}
+QCheckBox#fimFolderOption { color: #6ea8df; font-size: 7pt; spacing: 6px; }
+QCheckBox#fimFolderOption::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #167be2;
+    border-radius: 3px;
+    background: #061c35;
+}
+QCheckBox#fimFolderOption::indicator:checked {
+    background: #00b990;
+    border-color: #00d5a6;
+}
+QProgressBar#fimBaselineProgress, QProgressBar#fileIntegrityBaselineProgress {
+    color: #c7ddf2;
+    background: #071a33;
+    border: 1px solid #16466f;
+    border-radius: 5px;
+    text-align: center;
+    min-height: 13px;
+    max-height: 18px;
+    font-size: 7pt;
+}
+QProgressBar#fimBaselineProgress::chunk,
+QProgressBar#fileIntegrityBaselineProgress::chunk {
+    background: #087ee5;
+    border-radius: 4px;
 }
 QLabel#chartLegend {
     color: #9bb6d3;

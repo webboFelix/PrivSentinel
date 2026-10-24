@@ -6,12 +6,26 @@ import fnmatch
 import hashlib
 import json
 import os
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
+
 from src.core.event_models import SecurityEvent
 from src.storage.database import SQLiteDatabase
+
+
+class _IntegrityChangeHandler(FileSystemEventHandler):
+    def __init__(self, pending_changes: threading.Event) -> None:
+        super().__init__()
+        self.pending_changes = pending_changes
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        if event.event_type in {"created", "modified", "deleted", "moved"}:
+            self.pending_changes.set()
 
 
 class FileIntegrityMonitor:
@@ -20,27 +34,73 @@ class FileIntegrityMonitor:
         database: SQLiteDatabase,
         roots: tuple[str, ...],
         exclusions: tuple[str, ...] = (),
-        maximum_files: int = 50000,
+        maximum_files: int = 500000,
     ) -> None:
         self.database = database
         self.roots = tuple(Path(root).expanduser().resolve() for root in roots)
         self.exclusions = tuple(exclusions)
         self.maximum_files = maximum_files
+        self._pending_changes = threading.Event()
+        self._observer: Observer | None = None
         if not 1 <= maximum_files <= 500000:
             raise ValueError("maximum_files must be between 1 and 500000.")
 
+    def start(self) -> None:
+        if self._observer is not None:
+            return
+        if not self.roots:
+            raise ValueError("Select at least one file-integrity folder in Settings.")
+        observer = Observer()
+        handler = _IntegrityChangeHandler(self._pending_changes)
+        try:
+            for root in self.roots:
+                if not root.exists() or not root.is_dir():
+                    raise OSError(f"Integrity root is unavailable or not a folder: {root}")
+                observer.schedule(handler, str(root), recursive=True)
+            observer.start()
+        except (OSError, RuntimeError):
+            observer.stop()
+            raise
+        self._observer = observer
+        self._pending_changes.set()
+
+    def stop(self) -> None:
+        observer = self._observer
+        self._observer = None
+        if observer is not None:
+            observer.stop()
+            observer.join()
+
+    def collect(self) -> list[SecurityEvent]:
+        if self._observer is None:
+            self.start()
+        if not self._pending_changes.is_set():
+            return []
+        self._pending_changes.clear()
+        return self.scan()
+
     def establish_baseline(
-        self, progress_callback: Callable[[int], None] | None = None
+        self,
+        progress_callback: Callable[[int], None] | None = None,
+        progress_details_callback: Callable[[int, int], None] | None = None,
     ) -> int:
-        snapshot = self._snapshot(progress_callback)
+        if self.database.fetchone("SELECT 1 FROM file_integrity_baseline_config WHERE id = 1"):
+            raise RuntimeError(
+                "A trusted baseline already exists. Use the explicit baseline update action."
+            )
+        snapshot = self._snapshot(progress_callback, progress_details_callback)
         now = datetime.now(UTC).isoformat()
         with self.database.transaction() as connection:
-            connection.execute("DELETE FROM file_integrity_baselines")
             connection.executemany(
                 """
                 INSERT INTO file_integrity_baselines
                     (path, sha256, modified_ns, size, captured_at)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    sha256 = excluded.sha256,
+                    modified_ns = excluded.modified_ns,
+                    size = excluded.size,
+                    captured_at = excluded.captured_at
                 """,
                 [
                     (str(path), digest, mtime, size, now)
@@ -63,20 +123,133 @@ class FileIntegrityMonitor:
             )
         return len(snapshot)
 
+    def update_baseline(
+        self,
+        progress_callback: Callable[[int], None] | None = None,
+        actor: str = "user",
+        progress_details_callback: Callable[[int, int], None] | None = None,
+    ) -> int:
+        snapshot = self._snapshot(progress_callback, progress_details_callback)
+        now = datetime.now(UTC).isoformat()
+        roots_json = json.dumps([str(root) for root in self.roots])
+        exclusions_json = json.dumps(self.exclusions)
+        with self.database.transaction() as connection:
+            previous = {
+                str(row["path"]): str(row["sha256"])
+                for row in connection.execute("SELECT path, sha256 FROM file_integrity_baselines")
+            }
+            current_paths = {str(path) for path in snapshot}
+            for path in sorted(set(previous) | current_paths):
+                old_hash = previous.get(path)
+                new_hash = snapshot.get(Path(path), (None, 0, 0))[0]
+                if old_hash == new_hash:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO file_integrity_approvals
+                        (path, previous_sha256, approved_sha256, actor, approved_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (path, old_hash, new_hash, actor, now),
+                )
+            connection.executemany(
+                """
+                INSERT INTO file_integrity_baselines
+                    (path, sha256, modified_ns, size, captured_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    sha256 = excluded.sha256,
+                    modified_ns = excluded.modified_ns,
+                    size = excluded.size,
+                    captured_at = excluded.captured_at
+                """,
+                [
+                    (str(path), digest, mtime, size, now)
+                    for path, (digest, mtime, size) in snapshot.items()
+                ],
+            )
+            stale_paths = set(previous) - current_paths
+            connection.executemany(
+                "DELETE FROM file_integrity_baselines WHERE path = ?",
+                ((path,) for path in stale_paths),
+            )
+            connection.execute(
+                """
+                INSERT INTO file_integrity_baseline_config
+                    (id, roots_json, exclusions_json)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    roots_json = excluded.roots_json,
+                    exclusions_json = excluded.exclusions_json
+                """,
+                (roots_json, exclusions_json),
+            )
+            connection.execute("DELETE FROM file_integrity_findings")
+        return len(snapshot)
+
+    def approve_path(self, file_path: str, actor: str = "user") -> str | None:
+        path = Path(file_path).expanduser().resolve()
+        if not self.is_protected_path(path):
+            raise ValueError(f"File is outside the protected folders: {path}")
+        now = datetime.now(UTC).isoformat()
+        old = self.database.fetchone(
+            "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+            (str(path),),
+        )
+        old_hash = str(old["sha256"]) if old is not None else None
+        if path.is_file() and not self.is_excluded(path):
+            stat = path.stat()
+            new_hash = self.hash_file(path)
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO file_integrity_baselines
+                        (path, sha256, modified_ns, size, captured_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        sha256 = excluded.sha256,
+                        modified_ns = excluded.modified_ns,
+                        size = excluded.size,
+                        captured_at = excluded.captured_at
+                    """,
+                    (str(path), new_hash, stat.st_mtime_ns, stat.st_size, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO file_integrity_approvals
+                        (path, previous_sha256, approved_sha256, actor, approved_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(path), old_hash, new_hash, actor, now),
+                )
+                connection.execute(
+                    "DELETE FROM file_integrity_findings WHERE path = ?",
+                    (str(path),),
+                )
+            return new_hash
+        with self.database.transaction() as connection:
+            connection.execute("DELETE FROM file_integrity_baselines WHERE path = ?", (str(path),))
+            connection.execute(
+                """
+                INSERT INTO file_integrity_approvals
+                    (path, previous_sha256, approved_sha256, actor, approved_at)
+                VALUES (?, ?, NULL, ?, ?)
+                """,
+                (str(path), old_hash, actor, now),
+            )
+            connection.execute("DELETE FROM file_integrity_findings WHERE path = ?", (str(path),))
+        return None
+
     def scan(self) -> list[SecurityEvent]:
         config = self.database.fetchone(
-            "SELECT roots_json, exclusions_json "
-            "FROM file_integrity_baseline_config WHERE id = 1"
+            "SELECT roots_json, exclusions_json FROM file_integrity_baseline_config WHERE id = 1"
         )
         if config is None:
             raise RuntimeError("No file integrity baseline exists. Establish one first.")
         configured_roots = sorted(json.loads(config["roots_json"]))
         current_roots = sorted(str(root) for root in self.roots)
         configured_exclusions = tuple(json.loads(config["exclusions_json"]))
-        if (
-            configured_roots != current_roots
-            or configured_exclusions != self.exclusions
-        ):
+        if configured_roots != current_roots or configured_exclusions != self.exclusions:
             raise RuntimeError(
                 "The file integrity baseline does not match the current folders "
                 "and exclusions. Establish a new baseline before scanning."
@@ -85,8 +258,7 @@ class FileIntegrityMonitor:
             "SELECT path, sha256, modified_ns, size FROM file_integrity_baselines"
         )
         baseline = {
-            row["path"]: (row["sha256"], row["modified_ns"], row["size"])
-            for row in baseline_rows
+            row["path"]: (row["sha256"], row["modified_ns"], row["size"]) for row in baseline_rows
         }
         current = self._snapshot()
         current_paths = {str(path) for path in current}
@@ -113,8 +285,7 @@ class FileIntegrityMonitor:
                 previous_path = rename_pairs.get(path)
                 event_type = "file_renamed" if previous_path else "file_added"
                 description = (
-                    f"File path changed since baseline: {Path(previous_path).name} "
-                    f"to {path.name}"
+                    f"File path changed since baseline: {Path(previous_path).name} to {path.name}"
                     if previous_path
                     else f"File added since baseline: {path.name}"
                 )
@@ -150,82 +321,132 @@ class FileIntegrityMonitor:
                     attributes={"path": path},
                 )
             )
-        if events:
-            self._replace_snapshot(current)
-        return events
+        now = datetime.now(UTC).isoformat()
+        unique_events: list[SecurityEvent] = []
+        active_paths: set[str] = set()
+        with self.database.transaction() as connection:
+            known = {
+                str(row["path"]): str(row["fingerprint"])
+                for row in connection.execute(
+                    "SELECT path, fingerprint FROM file_integrity_findings"
+                )
+            }
+            for event in events:
+                path = str(event.attributes["path"])
+                active_paths.add(path)
+                fingerprint = "|".join(
+                    (
+                        event.event_type,
+                        str(event.attributes.get("sha256") or ""),
+                        str(event.attributes.get("previous_path") or ""),
+                    )
+                )
+                if known.get(path) != fingerprint:
+                    unique_events.append(event)
+                connection.execute(
+                    """
+                    INSERT INTO file_integrity_findings
+                        (path, fingerprint, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        fingerprint = excluded.fingerprint,
+                        first_seen = CASE
+                            WHEN file_integrity_findings.fingerprint = excluded.fingerprint
+                            THEN file_integrity_findings.first_seen
+                            ELSE excluded.first_seen
+                        END,
+                        last_seen = excluded.last_seen
+                    """,
+                    (path, fingerprint, now, now),
+                )
+            stale_paths = set(known) - active_paths
+            if stale_paths:
+                placeholders = ",".join("?" for _ in stale_paths)
+                connection.execute(
+                    f"DELETE FROM file_integrity_findings WHERE path IN ({placeholders})",
+                    tuple(stale_paths),
+                )
+        return unique_events
 
     def _snapshot(
-        self, progress_callback: Callable[[int], None] | None = None
+        self,
+        progress_callback: Callable[[int], None] | None = None,
+        progress_details_callback: Callable[[int, int], None] | None = None,
     ) -> dict[Path, tuple[str, int, int]]:
         if not self.roots:
             raise ValueError("Select at least one file-integrity folder in Settings.")
-        snapshot: dict[Path, tuple[str, int, int]] = {}
+        files: list[Path] = []
+        seen_paths: set[Path] = set()
 
         def raise_walk_error(error: OSError) -> None:
             raise OSError(
-                f"Could not read folder during file-integrity scan "
-                f"{error.filename or ''}: {error}"
+                f"Could not read folder during file-integrity scan {error.filename or ''}: {error}"
             ) from error
 
+        if progress_details_callback is not None:
+            progress_details_callback(-1, -1)
         for root in self.roots:
             if not root.exists() or not root.is_dir():
                 raise OSError(f"Integrity root is unavailable or not a folder: {root}")
             for directory, _, filenames in os.walk(root, onerror=raise_walk_error):
                 for filename in filenames:
                     path = Path(directory) / filename
-                    if not path.is_file() or self._excluded(path):
+                    if path in seen_paths or not path.is_file() or self._excluded(path):
                         continue
-                    if len(snapshot) >= self.maximum_files:
+                    if len(files) >= self.maximum_files:
                         raise RuntimeError(
-                            f"File integrity scan exceeds the "
-                            f"{self.maximum_files}-file safety cap."
+                            "File integrity scan exceeds the configured safety cap "
+                            f"of {self.maximum_files:,} files. Narrow the protected "
+                            "folders or add exclusions, then retry."
                         )
-                    try:
-                        stat = path.stat()
-                        digest = self._hash_file(path)
-                    except OSError as exc:
-                        raise OSError(
-                            f"Could not read file for integrity baseline {path}: {exc}"
-                        ) from exc
-                    snapshot[path] = (digest, stat.st_mtime_ns, stat.st_size)
-                    if progress_callback is not None and len(snapshot) % 25 == 0:
-                        progress_callback(len(snapshot))
-        if progress_callback is not None:
-            progress_callback(len(snapshot))
+                    seen_paths.add(path)
+                    files.append(path)
+        total = len(files)
+        if progress_details_callback is not None:
+            progress_details_callback(0, total)
+        snapshot: dict[Path, tuple[str, int, int]] = {}
+        for processed, path in enumerate(files, start=1):
+            try:
+                stat = path.stat()
+                digest = self.hash_file(path)
+            except OSError as exc:
+                raise OSError(f"Could not read file for integrity baseline {path}: {exc}") from exc
+            snapshot[path] = (digest, stat.st_mtime_ns, stat.st_size)
+            if processed % 25 == 0 or processed == total:
+                if progress_callback is not None:
+                    progress_callback(processed)
+                if progress_details_callback is not None:
+                    progress_details_callback(processed, total)
+        if total == 0 and progress_callback is not None:
+            progress_callback(total)
         return snapshot
 
     def _excluded(self, path: Path) -> bool:
         normalized = str(path).replace("\\", "/").casefold()
         return any(
             fnmatch.fnmatch(path.name.casefold(), pattern.casefold())
-            or fnmatch.fnmatch(
-                normalized, pattern.replace("\\", "/").casefold()
-            )
+            or fnmatch.fnmatch(normalized, pattern.replace("\\", "/").casefold())
             for pattern in self.exclusions
         )
 
+    def is_excluded(self, path: Path) -> bool:
+        return self._excluded(path)
+
+    def is_protected_path(self, path: Path) -> bool:
+        candidate = path.expanduser().resolve()
+        for root in self.roots:
+            try:
+                common = os.path.commonpath((str(candidate), str(root)))
+            except ValueError:
+                continue
+            if os.path.normcase(common) == os.path.normcase(str(root)):
+                return True
+        return False
+
     @staticmethod
-    def _hash_file(path: Path) -> str:
+    def hash_file(path: Path) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
-
-    def _replace_snapshot(
-        self, snapshot: dict[Path, tuple[str, int, int]]
-    ) -> None:
-        now = datetime.now(UTC).isoformat()
-        with self.database.transaction() as connection:
-            connection.execute("DELETE FROM file_integrity_baselines")
-            connection.executemany(
-                """
-                INSERT INTO file_integrity_baselines
-                    (path, sha256, modified_ns, size, captured_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [
-                    (str(path), digest, mtime, size, now)
-                    for path, (digest, mtime, size) in snapshot.items()
-                ],
-            )

@@ -45,7 +45,7 @@ from src.config.defaults import (
     DEFAULT_WINDOWS_LOG_COLLECTION_ENABLED,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _UNKNOWN_FACE_ACTIONS = frozenset({"notify_only", "lock_after_grace"})
 
@@ -90,6 +90,7 @@ class AppSettings:
     process_monitoring_enabled: bool = DEFAULT_PROCESS_MONITORING_ENABLED
     network_monitoring_enabled: bool = DEFAULT_NETWORK_MONITORING_ENABLED
     file_integrity_monitoring_enabled: bool = DEFAULT_FILE_INTEGRITY_MONITORING_ENABLED
+    file_integrity_auto_update_enabled: bool = True
     windows_log_collection_enabled: bool = DEFAULT_WINDOWS_LOG_COLLECTION_ENABLED
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
     process_exclusions: tuple[str, ...] = ()
@@ -118,6 +119,7 @@ class AppSettings:
             "process_monitoring_enabled",
             "network_monitoring_enabled",
             "file_integrity_monitoring_enabled",
+            "file_integrity_auto_update_enabled",
             "windows_log_collection_enabled",
             "download_scan_enabled",
         ):
@@ -370,6 +372,14 @@ class SettingsStore:
                     "download_scan_directory": None,
                     "download_scan_enabled": False,
                     "schema_version": 6,
+                }
+            )
+            version = 6
+        if version == 6:
+            migrated.update(
+                {
+                    "file_integrity_auto_update_enabled": True,
+                    "schema_version": 7,
                 }
             )
         return migrated

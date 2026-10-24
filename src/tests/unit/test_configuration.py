@@ -54,7 +54,7 @@ def test_settings_persist_across_store_instances(tmp_path):
     assert restarted.load() == saved
     assert saved.camera_index == 7
     assert json.loads(path.read_text(encoding="utf-8"))["camera_index"] == 7
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 6
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 7
 
 
 def test_existing_camera_index_is_preserved(tmp_path):
@@ -86,12 +86,13 @@ def test_legacy_version_one_settings_are_migrated(tmp_path):
 
     migrated = SettingsStore(path).load()
 
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert migrated.log_level == "WARNING"
     assert migrated.file_logging_enabled is True
     assert migrated.camera_access_enabled is False
     assert migrated.automatic_lock_enabled is False
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 6
+    assert migrated.file_integrity_auto_update_enabled is True
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 7
     assert migrated.recognition_model_download_prompted is False
     assert migrated.recognition_model_download_allowed is False
 
@@ -113,7 +114,7 @@ def test_version_four_settings_gain_model_download_preferences(tmp_path):
 
     migrated = SettingsStore(path).load()
 
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert not migrated.recognition_model_download_prompted
     assert not migrated.recognition_model_download_allowed
 

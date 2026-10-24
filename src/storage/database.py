@@ -99,6 +99,22 @@ class SQLiteDatabase:
                     roots_json TEXT NOT NULL,
                     exclusions_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS file_integrity_findings (
+                    path TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS file_integrity_approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    previous_sha256 TEXT,
+                    approved_sha256 TEXT,
+                    actor TEXT NOT NULL,
+                    approved_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_file_integrity_approvals_time
+                    ON file_integrity_approvals (approved_at DESC);
                 CREATE TABLE IF NOT EXISTS alerts (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL REFERENCES security_events(id),

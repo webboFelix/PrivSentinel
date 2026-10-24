@@ -2,6 +2,7 @@
 
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
 
@@ -56,6 +57,30 @@ def main() -> int:
     app.setStyleSheet(stylesheet.read_text(encoding="utf-8-sig"))
     try:
         services = ApplicationServices.create()
+        if (
+            not services.settings.file_integrity_roots
+            and services.database.fetchone(
+                "SELECT 1 FROM file_integrity_baseline_config WHERE id = 1"
+            )
+            is None
+        ):
+            home = Path.home()
+            documents = home / "OneDrive" / "Documents"
+            if not documents.is_dir():
+                documents = home / "Documents"
+            default_roots = tuple(
+                str(path.resolve())
+                for path in (documents, home / "Downloads", home / "Desktop")
+                if path.is_dir()
+            )
+            if default_roots:
+                services.save_settings(
+                    replace(
+                        services.settings,
+                        file_integrity_roots=default_roots,
+                        file_integrity_monitoring_enabled=True,
+                    )
+                )
     except (OSError, SettingsError, ValueError) as exc:
         QMessageBox.critical(
             None,

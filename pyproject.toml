@@ -17,6 +17,7 @@ dependencies = [
     "insightface",
     "scikit-image>=0.22,<0.26",
     "onnxruntime",
+    "watchdog>=4.0",
 ]
 
 [project.optional-dependencies]

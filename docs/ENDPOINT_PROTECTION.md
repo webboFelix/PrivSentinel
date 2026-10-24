@@ -73,7 +73,33 @@ baseline raises an in-app prompt to review recorded connections. Interface rates
 are not attributed to individual processes and do not inspect packet contents.
 Any IP block remains a separate, explicitly confirmed firewall action.
 
-File-integrity activity is grouped into the selected 24-hour, 7-day, or 30-day
-period when a configured baseline scan observes a change. A rename is inferred
-only when a missing path and a newly observed path have a unique matching hash;
-the monitor cannot distinguish a move from a copy followed by deletion.
+## File integrity monitoring
+
+On first launch, PrivSentinel selects available Documents, Downloads, and Desktop
+folders and creates a SHA-256 trusted baseline in the background. The initial
+baseline is not rebuilt on later launches. If a baseline already exists but no
+longer matches the configured folders, PrivSentinel leaves it intact and asks
+you to explicitly update it.
+
+The background monitor uses local filesystem notifications to trigger hash
+checks only when protected folders change, rather than repeatedly hashing the
+entire folder tree on a timer. **Verify Now** performs a full verification.
+New, modified, deleted, and inferred-renamed files are recorded as security
+events; changed files remain untrusted until you approve them.
+**Approve Selected Change** updates one file, while **Update Baseline Now**
+approves the current contents of all configured folders. Both actions retain
+the previous and approved hashes, timestamp, and local Windows account in
+Approval History and the audit log. Review newly downloaded or otherwise
+suspicious files before approving them. Baseline approval is not a malware scan
+or a safety verdict.
+
+The FIM dashboard's **Automatic baseline updates** preference enables
+single-file updates after an explicit approval. When it is off, individual
+approval is blocked and pending files remain unchanged in the baseline; the
+separate **Update Baseline Now** action remains available for a reviewed,
+explicit bulk update. New files are never trusted automatically. This
+preference is stored in the versioned local settings file.
+
+A rename is inferred only when a missing path and a newly observed path have a
+unique matching hash; the monitor cannot distinguish a move from a copy followed
+by deletion. File-integrity findings also appear in the event and alert history.

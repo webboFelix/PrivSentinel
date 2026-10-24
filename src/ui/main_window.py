@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QScrollArea,
     QStackedWidget,
     QSystemTrayIcon,
@@ -162,6 +163,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         self.statusBar().showMessage("Ready · local data sources are not connected", 5000)
+        self.file_integrity_progress = QProgressBar()
+        self.file_integrity_progress.setObjectName("fileIntegrityBaselineProgress")
+        self.file_integrity_progress.setRange(0, 1)
+        self.file_integrity_progress.setValue(0)
+        self.file_integrity_progress.setTextVisible(True)
+        self.file_integrity_progress.setFormat("Hashing files: %v / %m")
+        self.file_integrity_progress.setMinimumWidth(190)
+        self.file_integrity_progress.setMaximumWidth(260)
+        self.file_integrity_progress.hide()
+        self.statusBar().addPermanentWidget(self.file_integrity_progress)
 
         for definition in PAGE_DEFINITIONS:
             if (
@@ -210,17 +221,27 @@ class MainWindow(QMainWindow):
             page_scroll_area.setObjectName(f"pageViewport-{definition.key}")
             page_scroll_area.setWidgetResizable(True)
             page_scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-            page_scroll_area.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            )
-            page_scroll_area.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            )
+            page_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            page_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             page_scroll_area.setMinimumSize(0, 0)
             page_scroll_area.setWidget(page)
             self._page_containers[definition.key] = page_scroll_area
             self._page_scroll_areas[definition.key] = page_scroll_area
             self.page_stack.addWidget(page_scroll_area)
+
+        integrity_page = self._pages.get("file-integrity")
+        settings_page = self._pages.get("settings")
+        baseline_result_signal = getattr(integrity_page, "baselineSetupFinished", None)
+        baseline_result_handler = getattr(
+            settings_page, "_on_file_integrity_baseline_finished", None
+        )
+        if baseline_result_signal is not None and baseline_result_handler is not None:
+            baseline_result_signal.connect(baseline_result_handler)
+        baseline_progress_signal = getattr(integrity_page, "baselineProgressChanged", None)
+        if baseline_progress_signal is not None:
+            baseline_progress_signal.connect(self._on_file_integrity_baseline_progress)
+        if baseline_result_signal is not None:
+            baseline_result_signal.connect(self._on_file_integrity_baseline_finished)
 
         self.sidebar.pageSelected.connect(self.navigate_to)
 
@@ -234,24 +255,16 @@ class MainWindow(QMainWindow):
 
         self.services.identity_service.lockWarningRequested.connect(self._warn_before_lock)
 
-        self.services.identity_service.serviceError.connect(
-            self._show_service_error
-        )
+        self.services.identity_service.serviceError.connect(self._show_service_error)
 
         self.services.identity_service.eventRecorded.connect(self._identity_event)
 
-        self.services.identity_service.stateChanged.connect(
-            self._on_identity_state_changed
-        )
+        self.services.identity_service.stateChanged.connect(self._on_identity_state_changed)
 
         self.services.identity_service.profileChanged.connect(self._update_dashboard_identity)
 
-        self.services.identity_service.monitoringChanged.connect(
-            self._update_dashboard_identity
-        )
-        self.services.identity_service.cameraStateChanged.connect(
-            self._on_camera_state_changed
-        )
+        self.services.identity_service.monitoringChanged.connect(self._update_dashboard_identity)
+        self.services.identity_service.cameraStateChanged.connect(self._on_camera_state_changed)
         self.securityEventPublished.connect(self._update_alert_count)
         self._unsubscribe_security_events = self.services.event_pipeline.bus.subscribe(
             lambda _event: self.securityEventPublished.emit()
@@ -317,13 +330,14 @@ class MainWindow(QMainWindow):
 
         self.navigate_to("dashboard")
 
-        self.services.endpoint_service.stateChanged.connect(
-            self._on_endpoint_state_changed
-        )
+        self.services.endpoint_service.stateChanged.connect(self._on_endpoint_state_changed)
 
-        self.services.endpoint_service.serviceError.connect(
-            self._show_service_error
-        )
+        self.services.endpoint_service.serviceError.connect(self._show_service_error)
+
+        integrity_page = self._pages.get("file-integrity")
+        ensure_initial_baseline = getattr(integrity_page, "ensure_initial_baseline", None)
+        if ensure_initial_baseline is not None:
+            ensure_initial_baseline()
 
         self.services.endpoint_service.start_configured()
 
@@ -344,6 +358,44 @@ class MainWindow(QMainWindow):
     def _on_endpoint_state_changed(self, source: str, state: str) -> None:
         if not self._closing:
             self.statusBar().showMessage(f"{source}: {state}", 5000)
+
+    @Slot(int, int)
+    def _on_file_integrity_baseline_progress(self, processed: int, total: int) -> None:
+        progress = self.file_integrity_progress
+        progress.show()
+        if total < 0:
+            progress.setRange(0, 0)
+            progress.setFormat("Counting files to hash…")
+            self.statusBar().showMessage(
+                "Preparing trusted file-integrity baseline… counting files to hash."
+            )
+        elif total == 0:
+            progress.setRange(0, 1)
+            progress.setValue(1)
+            progress.setFormat("No files found; saving empty baseline")
+            self.statusBar().showMessage(
+                "No files found in the selected folders; saving an empty baseline."
+            )
+        else:
+            progress.setRange(0, total)
+            progress.setValue(processed)
+            progress.setFormat("Hashing files: %v / %m")
+            self.statusBar().showMessage(
+                f"Creating trusted baseline: hashed {processed:,} of {total:,} files."
+            )
+
+    @Slot(bool, str)
+    def _on_file_integrity_baseline_finished(self, succeeded: bool, message: str) -> None:
+        self.file_integrity_progress.hide()
+        if succeeded:
+            self.statusBar().showMessage(message, 20000)
+            self.statusBar().setToolTip(message)
+            return
+        self.statusBar().showMessage(
+            "File-integrity baseline failed. Review the FIM status for details.",
+            20000,
+        )
+        self.statusBar().setToolTip(message)
 
     @Slot(str)
     def _show_service_error(self, message: str) -> None:
@@ -474,10 +526,7 @@ class MainWindow(QMainWindow):
                     "WHERE path LIKE ? ORDER BY path LIMIT ?",
                     (token, 100 - len(records)),
                 )
-                records.extend(
-                    (f"FILE · {row['path']}", "file-integrity")
-                    for row in file_rows
-                )
+                records.extend((f"FILE · {row['path']}", "file-integrity") for row in file_rows)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.statusBar().showMessage(f"Global search failed: {exc}", 10000)
             return
@@ -510,12 +559,8 @@ class MainWindow(QMainWindow):
         worker = VoiceSearchWorker(model_directory, self)
         self._voice_search_worker = worker
         worker.recognized.connect(self._on_voice_search_recognized)
-        worker.failed.connect(
-            lambda message: self.statusBar().showMessage(message, 12000)
-        )
-        worker.finished.connect(
-            lambda worker=worker: self._voice_search_finished(worker)
-        )
+        worker.failed.connect(lambda message: self.statusBar().showMessage(message, 12000))
+        worker.finished.connect(lambda worker=worker: self._voice_search_finished(worker))
         self.topbar.set_voice_search_active(True)
         self._set_voice_assistant_card(True)
         worker.start()
@@ -545,8 +590,7 @@ class MainWindow(QMainWindow):
         if action in {"identity-protection", "identity-enrollment", "enrollment"}:
             model_preparation_active = (
                 self._model_preparation_process is not None
-                and self._model_preparation_process.state()
-                != QProcess.ProcessState.NotRunning
+                and self._model_preparation_process.state() != QProcess.ProcessState.NotRunning
             )
             resume_monitoring = self.services.identity_service.is_monitoring
             if resume_monitoring:
@@ -565,13 +609,9 @@ class MainWindow(QMainWindow):
             )
             if model_preparation_active:
                 dialog.set_model_preparation_pending()
-                self.recognitionModelPreparationFinished.connect(
-                    dialog.model_preparation_finished
-                )
+                self.recognitionModelPreparationFinished.connect(dialog.model_preparation_finished)
                 dialog.finished.connect(
-                    lambda _result, dialog=dialog: self._disconnect_model_preparation(
-                        dialog
-                    )
+                    lambda _result, dialog=dialog: self._disconnect_model_preparation(dialog)
                 )
 
             dialog.enrollmentCompleted.connect(self.services.identity_service.record_enrollment)
@@ -579,10 +619,7 @@ class MainWindow(QMainWindow):
             dialog.exec()
 
             if (
-                (
-                    resume_monitoring
-                    or self.services.settings.start_monitoring_on_launch
-                )
+                (resume_monitoring or self.services.settings.start_monitoring_on_launch)
                 and not self.services.identity_service.is_monitoring
                 and self.services.identity_service.profile is not None
             ):
@@ -713,25 +750,19 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, RuntimeError) as exc:
             self.statusBar().showMessage(f"Could not block {address}: {exc}", 12000)
             return
-        self.statusBar().showMessage(
-            f"Windows Firewall is blocking {address}", 8000
-        )
+        self.statusBar().showMessage(f"Windows Firewall is blocking {address}", 8000)
 
     def _quarantine_landscape_finding(self, finding_id: int) -> None:
         page = self._pages.get("malware-protection")
         if page is None or not hasattr(page, "quarantine_finding"):
-            self.statusBar().showMessage(
-                "The malware-protection page is unavailable.", 8000
-            )
+            self.statusBar().showMessage("The malware-protection page is unavailable.", 8000)
             return
         self.navigate_to("malware-protection")
         page.quarantine_finding(finding_id)
 
     def _disconnect_model_preparation(self, dialog: EnrollmentDialog) -> None:
         try:
-            self.recognitionModelPreparationFinished.disconnect(
-                dialog.model_preparation_finished
-            )
+            self.recognitionModelPreparationFinished.disconnect(dialog.model_preparation_finished)
         except RuntimeError:
             pass
 
@@ -772,8 +803,7 @@ class MainWindow(QMainWindow):
     def _start_recognition_model_preparation(self) -> None:
         if (
             self._model_preparation_process is not None
-            and self._model_preparation_process.state()
-            != QProcess.ProcessState.NotRunning
+            and self._model_preparation_process.state() != QProcess.ProcessState.NotRunning
         ):
             return
         process = QProcess(self)
@@ -839,9 +869,7 @@ class MainWindow(QMainWindow):
         self._model_preparation_process = None
         if process is not None:
             process.deleteLater()
-        if exit_code == 0 and recognition_model_is_installed(
-            self.services.paths.models_directory
-        ):
+        if exit_code == 0 and recognition_model_is_installed(self.services.paths.models_directory):
             message = "Local face-recognition model is ready for enrollment."
             self.statusBar().showMessage(
                 message,
@@ -898,10 +926,11 @@ class MainWindow(QMainWindow):
 
     def _complete_lock_warning(self) -> None:
         state = self.services.identity_service.current_state
-        if (
-            not self.services.settings.automatic_lock_enabled
-            or state in {"recognized", "stopped", "camera_unavailable"}
-        ):
+        if not self.services.settings.automatic_lock_enabled or state in {
+            "recognized",
+            "stopped",
+            "camera_unavailable",
+        }:
             self._dismiss_lock_warning()
             return
 
@@ -1052,7 +1081,6 @@ class MainWindow(QMainWindow):
         state = self.services.settings.window_state
 
         if state is not None:
-
             self.restoreState(QByteArray(base64.b64decode(state)))
 
         screen = QApplication.primaryScreen()
