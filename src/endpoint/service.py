@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
 from src.config.settings import AppSettings
 from src.core.event_pipeline import EventPipeline
-from src.endpoint.integrity_baseline import FileIntegrityMonitor
+from src.endpoint.integrity_baseline import (
+    FileIntegrityMonitor,
+    effective_file_integrity_exclusions,
+)
 from src.endpoint.process_monitor import ProcessMonitor
 from src.integrations.windows.event_logs import WindowsEventLogCollector
 from src.network.connection_monitor import ConnectionMonitor
@@ -36,6 +41,63 @@ class EndpointMonitoringService(QObject):
         self.pipeline = pipeline
         self.settings = settings
         self.workers: dict[str, MonitoringWorker] = {}
+        self._migrate_file_integrity_exclusions()
+
+    def _migrate_file_integrity_exclusions(self) -> None:
+        config = self.database.fetchone(
+            "SELECT roots_json, exclusions_json FROM file_integrity_baseline_config WHERE id = 1"
+        )
+        if config is None or not self.settings.file_integrity_roots:
+            return
+        stored_roots = {
+            os.path.normcase(str(Path(root).expanduser().resolve()))
+            for root in json.loads(config["roots_json"])
+        }
+        configured_roots = {
+            os.path.normcase(str(Path(root).expanduser().resolve()))
+            for root in self.settings.file_integrity_roots
+        }
+        if stored_roots != configured_roots:
+            return
+        exclusions = effective_file_integrity_exclusions(
+            self.settings.file_integrity_exclusions
+        )
+        if tuple(json.loads(config["exclusions_json"])) == exclusions:
+            return
+        monitor = FileIntegrityMonitor(
+            self.database,
+            self.settings.file_integrity_roots,
+            exclusions,
+        )
+        paths = {
+            str(row["path"])
+            for row in self.database.fetchall(
+                "SELECT path FROM file_integrity_baselines UNION "
+                "SELECT path FROM file_integrity_inventory"
+            )
+            if monitor.is_excluded(Path(str(row["path"])))
+        }
+        now = datetime.now(UTC).isoformat()
+        with self.database.transaction() as connection:
+            for path in paths:
+                connection.execute("DELETE FROM file_integrity_baselines WHERE path = ?", (path,))
+                connection.execute("DELETE FROM file_integrity_inventory WHERE path = ?", (path,))
+                connection.execute("DELETE FROM file_integrity_findings WHERE path = ?", (path,))
+            connection.execute(
+                "UPDATE file_integrity_baseline_config SET exclusions_json = ? WHERE id = 1",
+                (json.dumps(exclusions),),
+            )
+            remaining = {
+                Path(str(row["path"])): (
+                    str(row["sha256"]),
+                    int(row["modified_ns"]),
+                    int(row["size"]),
+                )
+                for row in connection.execute(
+                    "SELECT path, sha256, modified_ns, size FROM file_integrity_inventory"
+                )
+            }
+            monitor._persist_folder_stats(connection, remaining, now)
 
     def set_settings(self, settings: AppSettings) -> None:
         previous = self.settings
@@ -118,7 +180,9 @@ class EndpointMonitoringService(QObject):
         monitor = FileIntegrityMonitor(
             self.database,
             roots if roots is not None else self.settings.file_integrity_roots,
-            exclusions if exclusions is not None else self.settings.file_integrity_exclusions,
+            effective_file_integrity_exclusions(
+                exclusions if exclusions is not None else self.settings.file_integrity_exclusions
+            ),
         )
         exists = self.database.fetchone("SELECT 1 FROM file_integrity_baseline_config WHERE id = 1")
         actor = getpass.getuser()
@@ -152,7 +216,7 @@ class EndpointMonitoringService(QObject):
         monitor = FileIntegrityMonitor(
             self.database,
             self.settings.file_integrity_roots,
-            self.settings.file_integrity_exclusions,
+            effective_file_integrity_exclusions(self.settings.file_integrity_exclusions),
         )
         events = monitor.scan(
             progress_details_callback=progress_details_callback,
@@ -174,7 +238,7 @@ class EndpointMonitoringService(QObject):
         monitor = FileIntegrityMonitor(
             self.database,
             self.settings.file_integrity_roots,
-            self.settings.file_integrity_exclusions,
+            effective_file_integrity_exclusions(self.settings.file_integrity_exclusions),
         )
         actor = getpass.getuser()
         new_hash = monitor.approve_path(path, actor=actor)
@@ -187,12 +251,169 @@ class EndpointMonitoringService(QObject):
         )
         return new_hash
 
+    def acknowledge_file_integrity_event(self, event_id: str) -> str | None:
+        event = self.database.fetchone(
+            "SELECT attributes_json FROM security_events "
+            "WHERE id = ? AND source = 'file-integrity'",
+            (event_id,),
+        )
+        if event is None:
+            raise KeyError(f"File-integrity event not found: {event_id}")
+        attributes = json.loads(event["attributes_json"])
+        path = str(attributes.get("path", ""))
+        if not path:
+            raise ValueError("File-integrity event does not include a file path.")
+
+        actor = getpass.getuser()
+        previous_path = attributes.get("previous_path")
+        monitor = FileIntegrityMonitor(
+            self.database,
+            self.settings.file_integrity_roots,
+            effective_file_integrity_exclusions(self.settings.file_integrity_exclusions),
+        )
+        if attributes.get("is_directory"):
+            new_hash = monitor.approve_directory(
+                path,
+                actor=actor,
+                previous_directory_path=(
+                    previous_path
+                    if isinstance(previous_path, str) and previous_path != path
+                    else None
+                ),
+            )
+            self.pipeline.repository.record_audit(
+                actor,
+                "file-integrity.approve-change",
+                "success",
+                f"Approved {new_hash or 0} files in directory {Path(path).resolve()}.",
+            )
+        else:
+            new_hash = self.approve_file_integrity_change(path)
+            if isinstance(previous_path, str) and previous_path and previous_path != path:
+                self.approve_file_integrity_change(previous_path)
+        self._transition_file_integrity_alerts(event_id, "acknowledged")
+        self._set_file_integrity_event_status(event_id, "acknowledged")
+        self.pipeline.repository.record_audit(
+            actor,
+            "file-integrity.event.acknowledge",
+            "success",
+            f"Acknowledged {event_id}; approved current state for {path}.",
+        )
+        return new_hash
+
+    def investigate_file_integrity_event(self, event_id: str) -> str:
+        event = self.database.fetchone(
+            "SELECT description FROM security_events "
+            "WHERE id = ? AND source = 'file-integrity'",
+            (event_id,),
+        )
+        if event is None:
+            raise KeyError(f"File-integrity event not found: {event_id}")
+        existing = self.database.fetchone(
+            "SELECT investigation_id, status FROM file_integrity_event_status "
+            "WHERE event_id = ?",
+            (event_id,),
+        )
+        if existing is not None and existing["investigation_id"]:
+            investigation_id = str(existing["investigation_id"])
+        else:
+            investigation_id = self.pipeline.repository.create_investigation(
+                f"File integrity: {str(event['description'])[:150]}"
+            )
+            self.pipeline.repository.link_event_to_investigation(investigation_id, event_id)
+        self._transition_file_integrity_alerts(event_id, "investigating")
+        self._set_file_integrity_event_status(
+            event_id,
+            "investigating",
+            investigation_id=investigation_id,
+        )
+        return investigation_id
+
+    def close_file_integrity_investigation(self, event_id: str) -> None:
+        event = self.database.fetchone(
+            "SELECT 1 FROM security_events WHERE id = ? AND source = 'file-integrity'",
+            (event_id,),
+        )
+        if event is None:
+            raise KeyError(f"File-integrity event not found: {event_id}")
+        status = self.database.fetchone(
+            "SELECT investigation_id FROM file_integrity_event_status WHERE event_id = ?",
+            (event_id,),
+        )
+        investigation_id = (
+            str(status["investigation_id"])
+            if status is not None and status["investigation_id"]
+            else None
+        )
+        if investigation_id is not None:
+            self.pipeline.repository.set_investigation_status(investigation_id, "closed")
+        self._transition_file_integrity_alerts(event_id, "resolved")
+        self._set_file_integrity_event_status(event_id, "closed")
+        self.pipeline.repository.record_audit(
+            getpass.getuser(),
+            "file-integrity.event.close-investigation",
+            "success",
+            f"Closed investigation for {event_id}.",
+        )
+
+    def _set_file_integrity_event_status(
+        self,
+        event_id: str,
+        status: str,
+        investigation_id: str | None = None,
+    ) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO file_integrity_event_status
+                    (event_id, status, investigation_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    status = excluded.status,
+                    investigation_id = COALESCE(
+                        excluded.investigation_id,
+                        file_integrity_event_status.investigation_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (event_id, status, investigation_id, datetime.now(UTC).isoformat()),
+            )
+
+    def _transition_file_integrity_alerts(self, event_id: str, target: str) -> None:
+        alerts = self.database.fetchall(
+            "SELECT id, status FROM alerts WHERE event_id = ?",
+            (event_id,),
+        )
+        for alert in alerts:
+            alert_id = str(alert["id"])
+            current = str(alert["status"])
+            if target == "acknowledged":
+                if current in {"resolved", "dismissed"}:
+                    self.pipeline.repository.transition_alert(alert_id, "open")
+                    current = "open"
+                if current in {"open", "investigating"}:
+                    self.pipeline.repository.transition_alert(alert_id, "acknowledged")
+            elif target == "investigating":
+                if current in {"resolved", "dismissed"}:
+                    self.pipeline.repository.transition_alert(alert_id, "open")
+                    current = "open"
+                if current in {"open", "acknowledged"}:
+                    self.pipeline.repository.transition_alert(alert_id, "investigating")
+            elif target == "resolved":
+                if current in {"resolved", "dismissed"}:
+                    continue
+                if current == "open":
+                    self.pipeline.repository.transition_alert(alert_id, "acknowledged")
+                    current = "acknowledged"
+                if current in {"acknowledged", "investigating"}:
+                    self.pipeline.repository.transition_alert(alert_id, "resolved")
+
     def record_file_integrity_evidence(self, file_path: str) -> str:
         path = Path(file_path).expanduser().resolve()
         monitor = FileIntegrityMonitor(
             self.database,
             self.settings.file_integrity_roots,
-            self.settings.file_integrity_exclusions,
+            effective_file_integrity_exclusions(self.settings.file_integrity_exclusions),
         )
         if not monitor.is_protected_path(path):
             raise ValueError(f"File is outside the protected folders: {path}")
@@ -224,6 +445,7 @@ class EndpointMonitoringService(QObject):
         configured_exclusions = (
             exclusions if exclusions is not None else self.settings.file_integrity_exclusions
         )
+        configured_exclusions = effective_file_integrity_exclusions(configured_exclusions)
         config = self.database.fetchone(
             "SELECT roots_json, exclusions_json FROM file_integrity_baseline_config WHERE id = 1"
         )
@@ -263,7 +485,9 @@ class EndpointMonitoringService(QObject):
             return FileIntegrityMonitor(
                 self.database,
                 self.settings.file_integrity_roots,
-                self.settings.file_integrity_exclusions,
+                effective_file_integrity_exclusions(
+                    self.settings.file_integrity_exclusions
+                ),
             )
         raise KeyError(f"Unknown endpoint monitor: {source}")
 

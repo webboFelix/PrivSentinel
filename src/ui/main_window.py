@@ -391,6 +391,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 20000)
             self.statusBar().setToolTip(message)
             return
+        if message.startswith("Choose at least one folder"):
+            self.statusBar().showMessage(
+                "File-integrity monitoring is off until you choose protected folders.",
+                20000,
+            )
+            self.statusBar().setToolTip(message)
+            return
         self.statusBar().showMessage(
             "File-integrity baseline failed. Review the FIM status for details.",
             20000,

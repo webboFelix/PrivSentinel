@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from src.app.dependencies import ApplicationServices
 from src.config.settings import AppSettings
+from src.endpoint.integrity_baseline import effective_file_integrity_exclusions
 from src.ui.components.status_indicator import StatusIndicator
 from src.ui.dialogs.administrator_confirmation_dialog import (
     confirm_windows_administrator,
@@ -259,15 +260,13 @@ class SettingsPage(QWidget):
         roots_layout.addWidget(self.file_integrity_roots)
         roots_layout.addWidget(add_root, 0)
         endpoint_form.addRow("Integrity roots", roots_layout)
-        self.file_integrity_exclusions = QPlainTextEdit()
-        self.file_integrity_exclusions.setPlaceholderText(
-            "Excluded file names or paths, one wildcard pattern per line"
+        automatic_exclusions = QLabel(
+            "Temporary, cache, dependency, and virtual-environment folders are excluded "
+            "automatically from file-integrity monitoring."
         )
-        self.file_integrity_exclusions.setMaximumHeight(72)
-        self.file_integrity_exclusions.setPlainText(
-            "\n".join(services.settings.file_integrity_exclusions)
-        )
-        endpoint_form.addRow("Integrity exclusions", self.file_integrity_exclusions)
+        automatic_exclusions.setObjectName("muted")
+        automatic_exclusions.setWordWrap(True)
+        endpoint_form.addRow("Automatic integrity exclusions", automatic_exclusions)
         self.event_retention = QSpinBox()
         self.event_retention.setRange(1, 3650)
         self.event_retention.setSuffix(" days")
@@ -352,7 +351,6 @@ class SettingsPage(QWidget):
             return
         window.navigate_to("file-integrity")
         file_page.roots.setPlainText(self.file_integrity_roots.toPlainText())
-        file_page.exclusions.setPlainText(self.file_integrity_exclusions.toPlainText())
         resume_monitoring = self.file_integrity_monitoring.isChecked()
         file_page.enabled.setChecked(resume_monitoring)
         file_page.enabled.setText(
@@ -380,7 +378,7 @@ class SettingsPage(QWidget):
         dialog.setIcon(QMessageBox.Warning)
         dialog.setText(
             "Create or refresh the file-integrity baseline for the selected folders "
-            "and exclusions before enabling monitoring."
+            "before enabling monitoring."
         )
         create_button = dialog.addButton("Create baseline", QMessageBox.ActionRole)
         dialog.addButton(QMessageBox.StandardButton.Cancel)
@@ -415,10 +413,14 @@ class SettingsPage(QWidget):
             for line in self.file_integrity_roots.toPlainText().splitlines()
             if line.strip()
         )
-        exclusions = self._lines(self.file_integrity_exclusions)
+        exclusions = effective_file_integrity_exclusions(
+            self.services.settings.file_integrity_exclusions
+        )
+        monitoring_requested = self.file_integrity_monitoring.isChecked()
+        missing_integrity_roots = monitoring_requested and not roots
         try:
-            needs_baseline = self.file_integrity_monitoring.isChecked() and (
-                not roots or not self.services.endpoint_service.has_file_baseline(roots, exclusions)
+            needs_baseline = monitoring_requested and bool(roots) and (
+                not self.services.endpoint_service.has_file_baseline(roots, exclusions)
             )
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self._show_error("Could not verify the file-integrity baseline", exc)
@@ -492,7 +494,7 @@ class SettingsPage(QWidget):
             event_retention_days=self.event_retention.value(),
             process_exclusions=self._lines(self.process_exclusions),
             file_integrity_roots=roots,
-            file_integrity_exclusions=self._lines(self.file_integrity_exclusions),
+            file_integrity_exclusions=exclusions,
         )
         try:
             self.services.save_settings(settings)
@@ -509,7 +511,15 @@ class SettingsPage(QWidget):
             self._warn_missing_baseline()
             return
         self._file_integrity_enable_pending = False
-        if settings.file_integrity_monitoring_enabled:
+        if missing_integrity_roots:
+            self.file_integrity_monitoring.setChecked(False)
+            message = (
+                "Settings saved. File-integrity monitoring remains off until you "
+                "choose at least one protected folder."
+            )
+            self.status.set_text(message)
+            self.status.set_state("warning")
+        elif settings.file_integrity_monitoring_enabled:
             message = (
                 "Settings saved; file-integrity monitoring is enabled with a current baseline."
             )
@@ -646,7 +656,6 @@ class SettingsPage(QWidget):
         self.event_retention.setValue(settings.event_retention_days)
         self.process_exclusions.setPlainText("\n".join(settings.process_exclusions))
         self.file_integrity_roots.setPlainText("\n".join(settings.file_integrity_roots))
-        self.file_integrity_exclusions.setPlainText("\n".join(settings.file_integrity_exclusions))
 
     @staticmethod
     def _lines(editor: QPlainTextEdit) -> tuple[str, ...]:

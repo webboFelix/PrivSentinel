@@ -112,13 +112,6 @@ class SQLiteDatabase:
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS file_integrity_event_status (
-                    event_id TEXT PRIMARY KEY REFERENCES security_events(id) ON DELETE CASCADE,
-                    status TEXT NOT NULL CHECK(status IN
-                        ('open', 'acknowledged', 'investigating', 'closed')),
-                    investigation_id TEXT REFERENCES investigations(id) ON DELETE SET NULL,
-                    updated_at TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS file_integrity_scan_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     last_full_verified_at TEXT
@@ -173,6 +166,13 @@ class SQLiteDatabase:
                         ON DELETE CASCADE,
                     event_id TEXT NOT NULL REFERENCES security_events(id),
                     PRIMARY KEY (investigation_id, event_id)
+                );
+                CREATE TABLE IF NOT EXISTS file_integrity_event_status (
+                    event_id TEXT PRIMARY KEY REFERENCES security_events(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('open', 'acknowledged', 'investigating', 'closed')),
+                    investigation_id TEXT REFERENCES investigations(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS evidence_items (
                     id TEXT PRIMARY KEY,

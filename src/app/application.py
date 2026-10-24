@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
 
 from src.app.dependencies import ApplicationServices
 from src.config.settings import SettingsError
+from src.endpoint.integrity_baseline import effective_file_integrity_exclusions
 from src.identity.face_verifier import FaceRecognitionEngine
 from src.ui.icon_assets import icon_path
 from src.ui.main_window import MainWindow
@@ -57,8 +58,10 @@ def main() -> int:
     app.setStyleSheet(stylesheet.read_text(encoding="utf-8-sig"))
     try:
         services = ApplicationServices.create()
+        roots = services.settings.file_integrity_roots
+        using_first_run_defaults = False
         if (
-            not services.settings.file_integrity_roots
+            not roots
             and services.database.fetchone(
                 "SELECT 1 FROM file_integrity_baseline_config WHERE id = 1"
             )
@@ -73,14 +76,26 @@ def main() -> int:
                 for path in (documents, home / "Downloads", home / "Desktop")
                 if path.is_dir()
             )
-            if default_roots:
-                services.save_settings(
-                    replace(
-                        services.settings,
-                        file_integrity_roots=default_roots,
-                        file_integrity_monitoring_enabled=True,
-                    )
+            roots = default_roots
+            using_first_run_defaults = bool(default_roots)
+        automatic_exclusions = effective_file_integrity_exclusions(
+            services.settings.file_integrity_exclusions
+        )
+        if (
+            roots != services.settings.file_integrity_roots
+            or automatic_exclusions != services.settings.file_integrity_exclusions
+        ):
+            services.save_settings(
+                replace(
+                    services.settings,
+                    file_integrity_roots=roots,
+                    file_integrity_exclusions=automatic_exclusions,
+                    file_integrity_monitoring_enabled=(
+                        services.settings.file_integrity_monitoring_enabled
+                        or using_first_run_defaults
+                    ),
                 )
+            )
     except (OSError, SettingsError, ValueError) as exc:
         QMessageBox.critical(
             None,

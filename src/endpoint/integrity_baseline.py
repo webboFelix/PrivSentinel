@@ -20,6 +20,29 @@ from watchdog.observers.api import BaseObserver
 from src.core.event_models import SecurityEvent
 from src.storage.database import SQLiteDatabase
 
+DEFAULT_FILE_INTEGRITY_EXCLUSIONS = (
+    "**/.git/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/Temp/**",
+    "**/Caches/**",
+    "**/.cache/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "*.pyc",
+    "*.tmp",
+    "*.temp",
+)
+
+
+def effective_file_integrity_exclusions(
+    configured: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*DEFAULT_FILE_INTEGRITY_EXCLUSIONS, *configured)))
+
 
 class ScanCancelledError(RuntimeError):
     """Raised when a user cancels a file-integrity scan."""
@@ -35,9 +58,9 @@ class _IntegrityChangeHandler(FileSystemEventHandler):
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         if event.event_type in {"created", "modified", "deleted", "moved"}:
-            destination = getattr(event, "dest_path", None)
-            if event.is_directory and event.event_type not in {"deleted", "moved"}:
+            if event.is_directory and event.event_type == "modified":
                 return
+            destination = getattr(event, "dest_path", None)
             self.record_change(
                 event.event_type,
                 os.fsdecode(event.src_path),
@@ -55,7 +78,7 @@ class FileIntegrityMonitor:
         self,
         database: SQLiteDatabase,
         roots: tuple[str, ...],
-        exclusions: tuple[str, ...] = (),
+        exclusions: tuple[str, ...] = DEFAULT_FILE_INTEGRITY_EXCLUSIONS,
         maximum_files: int = 500000,
     ) -> None:
         self.database = database
@@ -74,6 +97,9 @@ class FileIntegrityMonitor:
         self._change_lock = threading.Lock()
         self._last_change_monotonic = 0.0
         self._pending_changes_queue: list[tuple[str, str, str | None, bool]] = []
+        self._known_directories = {
+            os.path.normcase(str(root)) for root in self.roots
+        }
         self._observer: BaseObserver | None = None
         self._last_scan_monotonic = 0.0
         if not 1 <= maximum_files <= 500000:
@@ -111,6 +137,9 @@ class FileIntegrityMonitor:
             self.start()
         now = time.monotonic()
         with self._change_lock:
+            periodic_scan_due = (
+                now - self._last_scan_monotonic >= self.PERIODIC_SCAN_INTERVAL_SECONDS
+            )
             if self._pending_changes.is_set():
                 if now - self._last_change_monotonic < self.EVENT_SETTLE_SECONDS:
                     return []
@@ -121,14 +150,61 @@ class FileIntegrityMonitor:
                 return []
             else:
                 changes = []
-        if changes and any(change[3] for change in changes):
+        directory_changes = [change for change in changes if change[3]]
+        file_changes = [change for change in changes if not change[3]]
+        directory_events = [
+            self._directory_event(event_type, source, destination)
+            for event_type, source, destination, is_directory in directory_changes
+            if is_directory and event_type in {"created", "deleted", "moved"}
+            and not self.is_excluded(Path(destination or source))
+        ]
+        for event_type, directory_path, _, _ in directory_changes:
+            directory = Path(directory_path)
+            if event_type == "created" and directory.is_dir():
+                file_changes.extend(
+                    ("created", str(path.resolve()), None, False)
+                    for path in self._iter_directory_files(directory)
+                )
+        if periodic_scan_due or any(
+            event_type in {"deleted", "moved"} for event_type, *_ in directory_changes
+        ):
             events = self.scan()
-        elif changes:
-            events = self._scan_changed_files(changes)
+        elif file_changes:
+            events = self._scan_changed_files(file_changes)
         else:
-            events = self.scan()
+            events = []
         self._last_scan_monotonic = time.monotonic()
-        return events
+        return [*directory_events, *events]
+
+    @staticmethod
+    def _directory_event(
+        event_type: str,
+        source: str,
+        destination: str | None,
+    ) -> SecurityEvent:
+        if event_type == "moved" and destination is not None:
+            normalized_type = "folder_renamed"
+            path = destination
+            description = f"Protected folder renamed: {Path(source).name} to {Path(destination).name}"
+        elif event_type == "deleted":
+            normalized_type = "folder_deleted"
+            path = source
+            description = f"Protected folder deleted: {Path(source).name}"
+        else:
+            normalized_type = "folder_added"
+            path = source
+            description = f"Folder added to a protected location: {Path(source).name}"
+        return SecurityEvent(
+            source="file-integrity",
+            event_type=normalized_type,
+            severity="medium" if normalized_type != "folder_added" else "low",
+            description=description,
+            attributes={
+                "path": path,
+                "previous_path": source if normalized_type == "folder_renamed" else None,
+                "is_directory": True,
+            },
+        )
 
     def _record_change(
         self,
@@ -137,17 +213,37 @@ class FileIntegrityMonitor:
         destination_path: str | None,
         is_directory: bool,
     ) -> None:
+        source = str(Path(source_path).resolve())
+        destination = (
+            str(Path(destination_path).resolve()) if destination_path is not None else None
+        )
+        source_key = os.path.normcase(source)
+        destination_key = os.path.normcase(destination) if destination is not None else None
         with self._change_lock:
+            if event_type in {"deleted", "moved"} and source_key in self._known_directories:
+                is_directory = True
+            if is_directory and event_type == "created":
+                self._known_directories.add(source_key)
+            elif is_directory and event_type == "deleted":
+                self._known_directories = {
+                    path
+                    for path in self._known_directories
+                    if path != source_key and not path.startswith(f"{source_key}{os.sep}")
+                }
+            elif is_directory and event_type == "moved":
+                self._known_directories = {
+                    path
+                    for path in self._known_directories
+                    if path != source_key and not path.startswith(f"{source_key}{os.sep}")
+                }
+                if destination_key is not None:
+                    self._known_directories.add(destination_key)
             self._last_change_monotonic = time.monotonic()
             self._pending_changes_queue.append(
                 (
                     event_type,
-                    str(Path(source_path).resolve()),
-                    (
-                        str(Path(destination_path).resolve())
-                        if destination_path is not None
-                        else None
-                    ),
+                    source,
+                    destination,
                     is_directory,
                 )
             )
@@ -658,6 +754,170 @@ class FileIntegrityMonitor:
             connection.execute("DELETE FROM file_integrity_findings WHERE path = ?", (str(path),))
         return None
 
+    def approve_directory(
+        self,
+        directory_path: str,
+        actor: str = "user",
+        previous_directory_path: str | None = None,
+    ) -> int:
+        path = Path(directory_path).expanduser().resolve()
+        if not self.is_protected_path(path):
+            raise ValueError(f"Folder is outside the protected folders: {path}")
+        previous_path = (
+            Path(previous_directory_path).expanduser().resolve()
+            if previous_directory_path
+            else None
+        )
+        affected_roots = [path]
+        if previous_path is not None:
+            if not self.is_protected_path(previous_path):
+                raise ValueError(f"Previous folder is outside the protected folders: {previous_path}")
+            affected_roots.append(previous_path)
+
+        snapshot: dict[str, tuple[str, int, int]] = {}
+        if path.is_dir():
+            for candidate in self._iter_directory_files(path):
+                if not self.is_protected_path(candidate):
+                    continue
+                try:
+                    stat = candidate.stat()
+                    digest = self.hash_file(candidate)
+                except OSError as exc:
+                    raise OSError(f"Could not approve file in monitored folder {candidate}: {exc}") from exc
+                snapshot[str(candidate.resolve())] = (
+                    digest,
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                )
+
+        def is_affected(candidate: str) -> bool:
+            try:
+                normalized = os.path.normcase(str(Path(candidate).resolve()))
+                return any(
+                    os.path.commonpath((normalized, os.path.normcase(str(root))))
+                    == os.path.normcase(str(root))
+                    for root in affected_roots
+                )
+            except ValueError:
+                return False
+
+        old_paths = {
+            str(row["path"])
+            for row in self.database.fetchall(
+                "SELECT path FROM file_integrity_baselines UNION "
+                "SELECT path FROM file_integrity_inventory"
+            )
+            if is_affected(str(row["path"]))
+        }
+        affected_paths = old_paths | set(snapshot)
+        now = datetime.now(UTC).isoformat()
+        with self.database.transaction() as connection:
+            for current_path in affected_paths:
+                old = connection.execute(
+                    "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+                    (current_path,),
+                ).fetchone()
+                old_hash = str(old["sha256"]) if old is not None else None
+                current = snapshot.get(current_path)
+                if current is None:
+                    connection.execute(
+                        "DELETE FROM file_integrity_baselines WHERE path = ?",
+                        (current_path,),
+                    )
+                    connection.execute(
+                        "DELETE FROM file_integrity_inventory WHERE path = ?",
+                        (current_path,),
+                    )
+                    approved_hash = None
+                else:
+                    digest, modified_ns, size = current
+                    connection.execute(
+                        """
+                        INSERT INTO file_integrity_baselines
+                            (path, sha256, modified_ns, size, captured_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            sha256 = excluded.sha256,
+                            modified_ns = excluded.modified_ns,
+                            size = excluded.size,
+                            captured_at = excluded.captured_at
+                        """,
+                        (current_path, digest, modified_ns, size, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO file_integrity_inventory (path, sha256, modified_ns, size)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            sha256 = excluded.sha256,
+                            modified_ns = excluded.modified_ns,
+                            size = excluded.size
+                        """,
+                        (current_path, digest, modified_ns, size),
+                    )
+                    approved_hash = digest
+                connection.execute(
+                    """
+                    INSERT INTO file_integrity_approvals
+                        (path, previous_sha256, approved_sha256, actor, approved_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (current_path, old_hash, approved_hash, actor, now),
+                )
+                connection.execute(
+                    "DELETE FROM file_integrity_findings WHERE path = ?",
+                    (current_path,),
+                )
+
+            inventory_paths = [
+                str(row["path"])
+                for row in connection.execute("SELECT path FROM file_integrity_inventory")
+            ]
+            counts = {
+                str(root): sum(
+                    1
+                    for inventory_path in inventory_paths
+                    if self._path_is_within(Path(inventory_path), root)
+                )
+                for root in self.roots
+            }
+            connection.executemany(
+                """
+                INSERT INTO file_integrity_folder_stats (root, file_count, scanned_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(root) DO UPDATE SET
+                    file_count = excluded.file_count,
+                    scanned_at = excluded.scanned_at
+                """,
+                ((root, count, now) for root, count in counts.items()),
+            )
+        return len(snapshot)
+
+    @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            return os.path.normcase(os.path.commonpath((str(path), str(root)))) == os.path.normcase(
+                str(root)
+            )
+        except ValueError:
+            return False
+
+    def _iter_directory_files(self, root: Path):
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for current, directories, filenames in os.walk(root, onerror=raise_walk_error):
+            current_path = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if not self.is_excluded(current_path / name)
+            ]
+            for filename in filenames:
+                candidate = current_path / filename
+                if candidate.is_file() and not self.is_excluded(candidate):
+                    yield candidate
+
     def scan(
         self,
         progress_details_callback: Callable[[int, int], None] | None = None,
@@ -724,23 +984,6 @@ class FileIntegrityMonitor:
         )
         current_paths = {str(path) for path in current}
         missing_paths = (set(baseline) | set(inventory)) - current_paths
-        added_by_hash: dict[str, list[Path]] = {}
-        missing_by_hash: dict[str, list[str]] = {}
-        for path, (digest, _, _) in current.items():
-            if str(path) not in baseline and str(path) not in inventory:
-                added_by_hash.setdefault(digest, []).append(path)
-        for path in missing_paths:
-            previous = baseline.get(path) or inventory.get(path)
-            if previous is not None:
-                missing_by_hash.setdefault(str(previous[0]), []).append(path)
-        rename_pairs: dict[Path, str] = {}
-        renamed_paths: set[str] = set()
-        # A unique hash suggests a move but cannot distinguish copy-then-delete.
-        for digest, added_paths in added_by_hash.items():
-            missing_matches = missing_by_hash.get(digest, [])
-            if len(added_paths) == len(missing_matches) == 1:
-                rename_pairs[added_paths[0]] = missing_matches[0]
-                renamed_paths.add(missing_matches[0])
         events: list[SecurityEvent] = []
         for path, (digest, mtime, size) in current.items():
             path_text = str(path)
@@ -751,13 +994,9 @@ class FileIntegrityMonitor:
                 event_type = "file_changed"
                 description = f"File content changed since last scan: {path.name}"
             elif old is None and old_inventory is None:
-                previous_path = rename_pairs.get(path)
-                event_type = "file_renamed" if previous_path else "file_added"
-                description = (
-                    f"File path changed since baseline: {Path(previous_path).name} to {path.name}"
-                    if previous_path
-                    else f"File added since baseline: {path.name}"
-                )
+                previous_path = None
+                event_type = "file_added"
+                description = f"File added since baseline: {path.name}"
             elif old is not None and old[0] != digest:
                 previous_path = None
                 event_type = "file_changed"
@@ -782,7 +1021,7 @@ class FileIntegrityMonitor:
                     },
                 )
             )
-        for path in missing_paths - renamed_paths:
+        for path in missing_paths:
             events.append(
                 SecurityEvent(
                     source="file-integrity",
@@ -916,18 +1155,41 @@ class FileIntegrityMonitor:
         return snapshot
 
     def _excluded(self, path: Path) -> bool:
-        normalized = str(path).replace("\\", "/").casefold()
-        return any(
-            fnmatch.fnmatch(path.name.casefold(), pattern.casefold())
-            or fnmatch.fnmatch(normalized, pattern.replace("\\", "/").casefold())
-            for pattern in self.exclusions
-        )
+        candidate = Path(os.path.abspath(os.fspath(path.expanduser())))
+        for pattern in self.exclusions:
+            normalized_pattern = pattern.replace("\\", "/").casefold()
+            if fnmatch.fnmatch(candidate.name.casefold(), normalized_pattern):
+                return True
+            if Path(pattern).is_absolute():
+                normalized_path = str(candidate).replace("\\", "/").casefold()
+                if fnmatch.fnmatch(normalized_path, normalized_pattern):
+                    return True
+                continue
+            for root in self._matching_roots(candidate, resolve=False):
+                try:
+                    relative_path = candidate.relative_to(root).as_posix().casefold()
+                except ValueError:
+                    continue
+                if fnmatch.fnmatch(relative_path, normalized_pattern) or fnmatch.fnmatch(
+                    f"/{relative_path}", normalized_pattern
+                ):
+                    return True
+        return False
 
     def is_excluded(self, path: Path) -> bool:
         return self._excluded(path)
 
-    def _matching_roots(self, path: Path) -> tuple[Path, ...]:
-        candidate = path.expanduser().resolve()
+    def _matching_roots(
+        self,
+        path: Path,
+        *,
+        resolve: bool = True,
+    ) -> tuple[Path, ...]:
+        candidate = (
+            path.expanduser().resolve()
+            if resolve
+            else Path(os.path.abspath(os.fspath(path.expanduser())))
+        )
         matches: list[Path] = []
         for root in self.roots:
             try:

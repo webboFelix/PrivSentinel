@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
+from src.core.event_models import SecurityEvent
 from src.endpoint.integrity_baseline import FileIntegrityMonitor, ScanCancelledError
 
 
@@ -36,6 +37,177 @@ def test_empty_folder_can_have_a_current_file_baseline(tmp_path):
 
     assert services.endpoint_service.establish_file_baseline(roots) == 0
     assert services.endpoint_service.has_file_baseline(roots)
+
+
+def test_file_integrity_event_actions_approve_and_track_investigation(tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    tracked = watched / "tracked.txt"
+    tracked.write_text("trusted", encoding="utf-8")
+    services.save_settings(
+        replace(services.settings, file_integrity_roots=(str(watched),))
+    )
+    services.endpoint_service.establish_file_baseline((str(watched),))
+    tracked.write_text("changed", encoding="utf-8")
+    event = SecurityEvent(
+        source="file-integrity",
+        event_type="file_changed",
+        severity="medium",
+        description="Tracked file changed",
+        attributes={"path": str(tracked.resolve())},
+    )
+    services.event_pipeline.publish(event)
+
+    approved_hash = services.endpoint_service.acknowledge_file_integrity_event(event.id)
+
+    baseline = services.database.fetchone(
+        "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+        (str(tracked.resolve()),),
+    )
+    status = services.database.fetchone(
+        "SELECT status, investigation_id FROM file_integrity_event_status WHERE event_id = ?",
+        (event.id,),
+    )
+    assert approved_hash == baseline["sha256"]
+    assert approved_hash == FileIntegrityMonitor.hash_file(tracked)
+    assert status["status"] == "acknowledged"
+
+    renamed = watched / "renamed.txt"
+    tracked.rename(renamed)
+    rename_event = SecurityEvent(
+        source="file-integrity",
+        event_type="file_renamed",
+        severity="low",
+        description="File renamed",
+        attributes={
+            "path": str(renamed.resolve()),
+            "previous_path": str(tracked.resolve()),
+        },
+    )
+    services.event_pipeline.publish(rename_event)
+    renamed_hash = services.endpoint_service.acknowledge_file_integrity_event(rename_event.id)
+    assert renamed_hash == FileIntegrityMonitor.hash_file(renamed)
+    assert services.database.fetchone(
+        "SELECT 1 FROM file_integrity_baselines WHERE path = ?",
+        (str(renamed.resolve()),),
+    ) is not None
+    assert services.database.fetchone(
+        "SELECT 1 FROM file_integrity_baselines WHERE path = ?",
+        (str(tracked.resolve()),),
+    ) is None
+
+    added = watched / "new.txt"
+    added.write_text("new content", encoding="utf-8")
+    added_event = SecurityEvent(
+        source="file-integrity",
+        event_type="file_added",
+        severity="low",
+        description="New file detected",
+        attributes={"path": str(added.resolve())},
+    )
+    services.event_pipeline.publish(added_event)
+    added_hash = services.endpoint_service.acknowledge_file_integrity_event(added_event.id)
+    assert added_hash == FileIntegrityMonitor.hash_file(added)
+    assert services.database.fetchone(
+        "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+        (str(added.resolve()),),
+    )["sha256"] == added_hash
+
+    investigation_id = services.endpoint_service.investigate_file_integrity_event(event.id)
+    status = services.database.fetchone(
+        "SELECT status, investigation_id FROM file_integrity_event_status WHERE event_id = ?",
+        (event.id,),
+    )
+    assert status["status"] == "investigating"
+    assert status["investigation_id"] == investigation_id
+
+    services.endpoint_service.close_file_integrity_investigation(event.id)
+
+    status = services.database.fetchone(
+        "SELECT status FROM file_integrity_event_status WHERE event_id = ?",
+        (event.id,),
+    )
+    investigation = services.database.fetchone(
+        "SELECT status FROM investigations WHERE id = ?",
+        (investigation_id,),
+    )
+    assert status["status"] == "closed"
+    assert investigation["status"] == "closed"
+
+
+def test_acknowledging_new_folder_hashes_and_approves_its_contents(tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    services.save_settings(
+        replace(services.settings, file_integrity_roots=(str(watched),))
+    )
+    services.endpoint_service.establish_file_baseline((str(watched),))
+    created = watched / "new-folder"
+    created.mkdir()
+    content = created / "file.txt"
+    content.write_text("reviewed folder content", encoding="utf-8")
+    event = SecurityEvent(
+        source="file-integrity",
+        event_type="folder_added",
+        severity="low",
+        description="Folder added",
+        attributes={"path": str(created.resolve()), "is_directory": True},
+    )
+    services.event_pipeline.publish(event)
+
+    services.endpoint_service.acknowledge_file_integrity_event(event.id)
+
+    baseline = services.database.fetchone(
+        "SELECT sha256 FROM file_integrity_baselines WHERE path = ?",
+        (str(content.resolve()),),
+    )
+    assert baseline["sha256"] == FileIntegrityMonitor.hash_file(content)
+
+
+def test_startup_migrates_existing_baseline_to_automatic_exclusions(tmp_path):
+    paths = AppPaths(tmp_path / "local")
+    services = ApplicationServices.create(paths)
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    tracked = watched / "tracked.txt"
+    tracked.write_text("tracked", encoding="utf-8")
+    generated = watched / ".git"
+    generated.mkdir()
+    generated_file = generated / "config"
+    generated_file.write_text("generated", encoding="utf-8")
+    services.save_settings(
+        replace(services.settings, file_integrity_roots=(str(watched),))
+    )
+    FileIntegrityMonitor(services.database, (str(watched),), ()).establish_baseline()
+
+    restarted = ApplicationServices.create(paths)
+
+    assert restarted.database.fetchone(
+        "SELECT 1 FROM file_integrity_baselines WHERE path = ?",
+        (str(tracked.resolve()),),
+    ) is not None
+    assert restarted.database.fetchone(
+        "SELECT 1 FROM file_integrity_baselines WHERE path = ?",
+        (str(generated_file.resolve()),),
+    ) is None
+    assert restarted.endpoint_service.has_file_baseline((str(watched),))
+
+
+def test_exclusion_checks_do_not_resolve_every_inventory_path(tmp_path, monkeypatch):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    generated = watched / ".git" / "config"
+    watched.mkdir()
+    monitor = FileIntegrityMonitor(services.database, (str(watched),))
+
+    def fail_resolve(self, *args, **kwargs):
+        raise AssertionError(f"Unexpected filesystem path resolution: {self}")
+
+    monkeypatch.setattr(type(generated), "resolve", fail_resolve)
+
+    assert monitor.is_excluded(generated)
 
 
 def test_empty_folder_baseline_can_scan_new_files(tmp_path):
@@ -345,6 +517,72 @@ def test_file_integrity_watcher_detects_create_modify_rename_and_delete_in_real_
         monitor.stop()
 
 
+def test_file_integrity_watcher_reports_folder_creation_and_deletion(tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    roots = (str(watched),)
+    services.endpoint_service.establish_file_baseline(roots)
+    monitor = FileIntegrityMonitor(services.database, roots)
+    monitor.start()
+    try:
+        monitor.collect()
+
+        def wait_for_event(event_type: str):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                events = monitor.collect()
+                match = next((event for event in events if event.event_type == event_type), None)
+                if match is not None:
+                    return match
+                time.sleep(0.05)
+            pytest.fail(f"Expected filesystem notification {event_type!r}.")
+
+        created = watched / "empty-folder"
+        created.mkdir()
+        added_event = wait_for_event("folder_added")
+        assert added_event.attributes["path"] == str(created.resolve())
+
+        created.rmdir()
+        deleted_event = wait_for_event("folder_deleted")
+        assert deleted_event.attributes["path"] == str(created.resolve())
+    finally:
+        monitor.stop()
+
+
+def test_created_folder_indexes_and_counts_files_beneath_it(tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    roots = (str(watched),)
+    services.endpoint_service.establish_file_baseline(roots)
+    monitor = FileIntegrityMonitor(services.database, roots)
+    monitor.start()
+    try:
+        folder = watched / "new-folder"
+        folder.mkdir()
+        content = folder / "created.txt"
+        content.write_text("new file content", encoding="utf-8")
+        monitor._record_change("created", str(folder), None, True)
+        time.sleep(monitor.EVENT_SETTLE_SECONDS + 0.05)
+
+        events = monitor.collect()
+
+        assert {event.event_type for event in events} == {"folder_added", "file_added"}
+        inventory = services.database.fetchone(
+            "SELECT sha256 FROM file_integrity_inventory WHERE path = ?",
+            (str(content.resolve()),),
+        )
+        count = services.database.fetchone(
+            "SELECT file_count FROM file_integrity_folder_stats WHERE root = ?",
+            (str(watched.resolve()),),
+        )
+        assert inventory["sha256"] == FileIntegrityMonitor.hash_file(content)
+        assert count["file_count"] == 1
+    finally:
+        monitor.stop()
+
+
 def test_file_integrity_watcher_does_not_walk_entire_tree_for_each_file_event(
     tmp_path, monkeypatch
 ):
@@ -475,7 +713,7 @@ def test_file_integrity_service_worker_starts_and_stops_watcher(qtbot, tmp_path)
     assert not worker.isRunning()
 
 
-def test_file_move_with_unique_matching_hash_is_reported_as_inferred_rename(tmp_path):
+def test_full_scan_does_not_infer_rename_from_hash_alone(tmp_path):
     services = ApplicationServices.create(AppPaths(tmp_path / "local"))
     watched = tmp_path / "rename-watched"
     watched.mkdir()
@@ -487,11 +725,34 @@ def test_file_move_with_unique_matching_hash_is_reported_as_inferred_rename(tmp_
 
     events = FileIntegrityMonitor(services.database, roots).scan()
 
-    assert [event.event_type for event in events] == ["file_renamed"]
-    assert os.path.normcase(events[0].attributes["previous_path"]) == os.path.normcase(
-        str(original)
-    )
-    assert "path changed" in events[0].description
+    assert {event.event_type for event in events} == {"file_added", "file_missing"}
+    assert all(event.event_type != "file_renamed" for event in events)
+
+
+def test_watcher_create_and_delete_with_matching_hash_are_not_a_rename(tmp_path):
+    services = ApplicationServices.create(AppPaths(tmp_path / "local"))
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    removed = watched / "removed.txt"
+    removed.write_text("same bytes", encoding="utf-8")
+    roots = (str(watched),)
+    services.endpoint_service.establish_file_baseline(roots)
+    monitor = FileIntegrityMonitor(services.database, roots)
+    monitor.start()
+    try:
+        monitor.collect()
+        added = watched / "added.txt"
+        removed.unlink()
+        added.write_text("same bytes", encoding="utf-8")
+        monitor._record_change("deleted", str(removed), None, False)
+        monitor._record_change("created", str(added), None, False)
+        time.sleep(monitor.EVENT_SETTLE_SECONDS + 0.05)
+
+        events = monitor.collect()
+
+        assert {event.event_type for event in events} == {"file_added", "file_missing"}
+    finally:
+        monitor.stop()
 
 
 def test_baseline_reports_progress_while_hashing_files(tmp_path):

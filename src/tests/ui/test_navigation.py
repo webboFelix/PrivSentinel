@@ -810,7 +810,7 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(qtbot, win
     assert settings.file_integrity_roots.toPlainText() == str(watched)
 
 
-def test_file_integrity_deletion_is_visible_in_recent_events(window, tmp_path):
+def test_file_integrity_deletion_is_visible_in_recent_events(qtbot, window, tmp_path):
     page = window._pages["file-integrity"]
     watched = tmp_path / "fim-delete"
     watched.mkdir()
@@ -818,7 +818,7 @@ def test_file_integrity_deletion_is_visible_in_recent_events(window, tmp_path):
     tracked.write_text("trusted", encoding="utf-8")
     page.roots.setPlainText(str(watched))
     page._save_configuration()
-    window.services.endpoint_service.establish_file_baseline()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
     tracked.unlink()
 
     assert window.services.endpoint_service.verify_file_integrity() == 1
@@ -843,7 +843,7 @@ def test_live_file_operations_refresh_fim_events_without_manual_refresh(
     deleted.write_text("delete me", encoding="utf-8")
     page.roots.setPlainText(str(watched))
     page._save_configuration()
-    window.services.endpoint_service.establish_file_baseline()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
     window.services.save_settings(
         replace(
             window.services.settings,
@@ -905,24 +905,53 @@ def test_live_file_operations_refresh_fim_events_without_manual_refresh(
         window.services.endpoint_service.stop("file-integrity")
 
 
-def test_fim_folder_count_and_suggested_exclusions_are_explicit(window, tmp_path):
+def test_fim_folder_count_uses_inventory_and_exclusions_are_automatic(qtbot, window, tmp_path):
     page = window._pages["file-integrity"]
     watched = tmp_path / "fim-count"
     watched.mkdir()
     (watched / "one.txt").write_text("one", encoding="utf-8")
     (watched / "two.txt").write_text("two", encoding="utf-8")
+    generated = watched / ".git"
+    generated.mkdir()
+    (generated / "config").write_text("generated", encoding="utf-8")
     page.roots.setPlainText(str(watched))
     page._save_configuration()
-    window.services.endpoint_service.establish_file_baseline()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
     page.refresh_data()
 
     assert page._folder_count_labels[str(watched)].text() == "2 files"
-    assert window.services.settings.file_integrity_exclusions == ()
+    assert page.findChild(QLabel, "muted") is not None
+    assert not hasattr(page, "exclusions")
+    assert not hasattr(page, "suggest_exclusions_button")
 
-    page.suggest_exclusions_button.click()
+    with window.services.database.transaction() as connection:
+        connection.execute("DELETE FROM file_integrity_folder_stats")
+    page.refresh_data()
+    assert page._folder_count_labels[str(watched)].text() == "2 files"
 
-    assert "**/.git/**" in page.exclusions.toPlainText().splitlines()
-    assert window.services.settings.file_integrity_exclusions == ()
+
+def test_first_launch_waits_for_a_folder_then_creates_baseline(qtbot, window, tmp_path):
+    page = window._pages["file-integrity"]
+    assert page._baseline_worker is None
+    assert "Choose at least one folder" in page.status.text_label.text()
+
+    watched = tmp_path / "first-run-folder"
+    watched.mkdir()
+    (watched / "starter.txt").write_text("starter", encoding="utf-8")
+    page.roots.setPlainText(str(watched))
+    page._save_configuration()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
+
+    assert window.services.endpoint_service.has_file_baseline((str(watched),))
+    page.refresh_data()
+    assert page._folder_count_labels[str(watched)].text() == "1 file", (
+        window.services.settings.file_integrity_roots,
+        window.services.database.fetchall(
+            "SELECT root, file_count FROM file_integrity_folder_stats"
+        ),
+        page.status.text_label.text(),
+    )
+    assert window.services.settings.file_integrity_monitoring_enabled
 
 
 def test_fim_baseline_table_limits_rendering_for_large_baselines(window):
@@ -949,7 +978,7 @@ def test_fim_baseline_table_limits_rendering_for_large_baselines(window):
     assert page.baseline_table_summary.text() == "Showing 500 of 501 trusted files."
 
 
-def test_fim_folder_settings_rows_do_not_repeat_on_refresh(window, tmp_path):
+def test_fim_folder_settings_rows_do_not_repeat_on_refresh(qtbot, window, tmp_path):
     page = window._pages["file-integrity"]
     folders = tuple(tmp_path / name for name in ("Documents", "Downloads", "Desktop"))
     roots = tuple(str(folder) for folder in folders)
@@ -957,6 +986,7 @@ def test_fim_folder_settings_rows_do_not_repeat_on_refresh(window, tmp_path):
         folder.mkdir()
     page.roots.setPlainText("\n".join(roots))
     page._save_configuration()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=10_000)
 
     for _ in range(5):
         page.refresh_data()
@@ -1105,13 +1135,12 @@ def test_settings_create_baseline_button_starts_baseline(qtbot, window, tmp_path
     watched.mkdir()
     (watched / "tracked.txt").write_text("baseline", encoding="utf-8")
     settings_page.file_integrity_roots.setPlainText(str(watched))
-    settings_page.file_integrity_exclusions.setPlainText("")
 
     settings_page.file_integrity_baseline_button.click()
     file_page = window._pages["file-integrity"]
     qtbot.waitUntil(lambda: file_page._baseline_worker is None, timeout=10_000)
 
-    assert window.services.endpoint_service.has_file_baseline((str(watched),), ())
+    assert window.services.endpoint_service.has_file_baseline((str(watched),))
     assert "Trusted baseline created" in file_page.status.text_label.text()
     assert str(window.services.paths.database_file) in file_page.status.text_label.text()
     assert (-1, -1) in progress_updates
@@ -1346,7 +1375,7 @@ def test_settings_page_persists_changes_and_updates_logging(window):
 
     assert window.services.settings.log_level == "ERROR"
     assert window.services.settings.log_retention_days == 90
-    assert "updated" in settings_page.status.text_label.text()
+    assert "saved successfully" in settings_page.status.text_label.text().lower()
 
 
 def test_window_geometry_is_restored_after_application_restart(qtbot, tmp_path):
@@ -1450,6 +1479,9 @@ def test_missing_file_integrity_baseline_does_not_crash_application_startup(qtbo
     qtbot.addWidget(window)
 
     assert window.services.endpoint_service.workers == {}
-    assert "Establish a file integrity baseline" in window.statusBar().currentMessage()
+    page = window._pages["file-integrity"]
+    assert "Choose at least one folder" in page.status.text_label.text()
+    assert not window.services.settings.file_integrity_monitoring_enabled
+    assert "choose protected folders" in window.statusBar().currentMessage()
 
     window.close()
