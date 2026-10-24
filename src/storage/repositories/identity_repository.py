@@ -36,7 +36,8 @@ class IdentityRepository:
     def profile(self) -> IdentityProfile | None:
         row = self.database.fetchone(
             "SELECT display_name, enrolled_at, model_name, template_dimensions, "
-            "consent_recorded_at FROM identity_profile WHERE id = 1"
+            "consent_recorded_at, enrollment_quality "
+            "FROM identity_profile WHERE id = 1"
         )
         if row is None:
             return None
@@ -47,6 +48,11 @@ class IdentityRepository:
             model_name=row["model_name"],
             template_dimensions=row["template_dimensions"],
             consent_recorded_at=datetime.fromisoformat(row["consent_recorded_at"]),
+            enrollment_quality=(
+                float(row["enrollment_quality"])
+                if row["enrollment_quality"] is not None
+                else None
+            ),
             **details,
         )
 
@@ -90,6 +96,7 @@ class IdentityRepository:
         model_name: str,
         consent_recorded_at: datetime,
         profile_details: dict[str, str] | None = None,
+        enrollment_quality: float | None = None,
     ) -> IdentityProfile:
         name = display_name.strip()
         vector = np.asarray(embedding, dtype=np.float32)
@@ -108,6 +115,10 @@ class IdentityRepository:
             raise ValueError("Face embedding must be a finite, non-zero vector.")
         if not model_name or len(model_name) > 120:
             raise ValueError("A valid recognition model name is required.")
+        if enrollment_quality is not None and (
+            not np.isfinite(enrollment_quality) or not 0.0 <= enrollment_quality <= 1.0
+        ):
+            raise ValueError("Enrollment quality must be between 0 and 1.")
         now = datetime.now(UTC)
         stream = io.BytesIO()
         normalized = vector / np.linalg.norm(vector, axis=1)[:, np.newaxis]
@@ -128,14 +139,15 @@ class IdentityRepository:
                     """
                     INSERT INTO identity_profile (
                         id, display_name, enrolled_at, model_name,
-                        template_dimensions, consent_recorded_at
-                    ) VALUES (1, ?, ?, ?, ?, ?)
+                        template_dimensions, consent_recorded_at, enrollment_quality
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         display_name=excluded.display_name,
                         enrolled_at=excluded.enrolled_at,
                         model_name=excluded.model_name,
                         template_dimensions=excluded.template_dimensions,
-                        consent_recorded_at=excluded.consent_recorded_at
+                        consent_recorded_at=excluded.consent_recorded_at,
+                        enrollment_quality=excluded.enrollment_quality
                     """,
                     (
                         name,
@@ -143,6 +155,7 @@ class IdentityRepository:
                         model_name,
                         int(vector.shape[1]),
                         consent_recorded_at.astimezone(UTC).isoformat(),
+                        enrollment_quality,
                     ),
                 )
         except BaseException as exc:
@@ -160,6 +173,7 @@ class IdentityRepository:
             model_name,
             int(vector.shape[1]),
             consent_recorded_at,
+            enrollment_quality=enrollment_quality,
             **details,
         )
 

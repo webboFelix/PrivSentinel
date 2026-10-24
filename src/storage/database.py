@@ -57,7 +57,8 @@ class SQLiteDatabase:
                     enrolled_at TEXT NOT NULL,
                     model_name TEXT NOT NULL,
                     template_dimensions INTEGER NOT NULL,
-                    consent_recorded_at TEXT NOT NULL
+                    consent_recorded_at TEXT NOT NULL,
+                    enrollment_quality REAL
                 );
                 CREATE TABLE IF NOT EXISTS identity_events (
                     id TEXT PRIMARY KEY,
@@ -94,6 +95,12 @@ class SQLiteDatabase:
                     size INTEGER NOT NULL,
                     captured_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS file_integrity_inventory (
+                    path TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL,
+                    modified_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS file_integrity_baseline_config (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     roots_json TEXT NOT NULL,
@@ -104,6 +111,22 @@ class SQLiteDatabase:
                     fingerprint TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS file_integrity_event_status (
+                    event_id TEXT PRIMARY KEY REFERENCES security_events(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK(status IN
+                        ('open', 'acknowledged', 'investigating', 'closed')),
+                    investigation_id TEXT REFERENCES investigations(id) ON DELETE SET NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS file_integrity_scan_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_full_verified_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS file_integrity_folder_stats (
+                    root TEXT PRIMARY KEY,
+                    file_count INTEGER NOT NULL,
+                    scanned_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS file_integrity_approvals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,6 +298,16 @@ class SQLiteDatabase:
             if "dedupe_key" not in alert_columns:
                 self._connection.execute(
                     "ALTER TABLE alerts ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''"
+                )
+            profile_columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(identity_profile)"
+                )
+            }
+            if "enrollment_quality" not in profile_columns:
+                self._connection.execute(
+                    "ALTER TABLE identity_profile ADD COLUMN enrollment_quality REAL"
                 )
 
     def close(self) -> None:

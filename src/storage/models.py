@@ -11,6 +11,7 @@ class IdentityProfile:
     model_name: str
     template_dimensions: int
     consent_recorded_at: datetime
+    enrollment_quality: float | None = None
     email: str = ""
     department: str = ""
     employee_id: str = ""

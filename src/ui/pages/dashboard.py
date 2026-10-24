@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from src.app.dependencies import ApplicationServices
 from src.endpoint.host_topology import HostTopology, HostTopologyCollector
 from src.endpoint.process_monitor import ProcessMonitor
+from src.identity.security_score import calculate_identity_security_score
 from src.ui.components.dashboard_activity import (
     DashboardLiveFeed,
     DashboardNetworkPanel,
@@ -380,6 +381,12 @@ class DashboardPage(QWidget):
                 "WHERE occurred_at >= ? GROUP BY state",
                 (start_utc.isoformat(),),
             )
+            identity_events = self.services.identity_repository.list_events(limit=20)
+            identity_profile = self.services.identity_repository.profile()
+            latest_successful_verification = self.services.database.fetchone(
+                "SELECT MAX(occurred_at) AS occurred_at FROM identity_events "
+                "WHERE state = 'recognized'"
+            )
             collector_counts = self.services.database.fetchall(
                 "SELECT source, COUNT(*) AS count FROM security_events "
                 "WHERE occurred_at >= ? GROUP BY source",
@@ -401,7 +408,7 @@ class DashboardPage(QWidget):
                 (start_utc.isoformat(),),
             )
             active_file_alerts = self.services.database.fetchall(
-                "SELECT e.attributes_json FROM alerts a "
+                "SELECT e.event_type, e.attributes_json FROM alerts a "
                 "JOIN security_events e ON e.id = a.event_id "
                 "WHERE a.status IN ('open', 'acknowledged', 'investigating') "
                 "AND e.source LIKE 'file-integrity%'"
@@ -480,6 +487,7 @@ class DashboardPage(QWidget):
         identity_passes = identity_states.get("recognized", 0)
         baseline_files = int(file_count["count"] if file_count else 0)
         alerted_file_paths: set[str] = set()
+        active_new_file_paths: set[str] = set()
         file_alerts_without_path = 0
         for row in active_file_alerts:
             try:
@@ -490,12 +498,16 @@ class DashboardPage(QWidget):
             path = attributes.get("path") if isinstance(attributes, dict) else None
             if isinstance(path, str) and path:
                 alerted_file_paths.add(path.casefold())
+                if str(row["event_type"]).casefold() == "file_added":
+                    active_new_file_paths.add(path.casefold())
             else:
                 file_alerts_without_path += 1
+        monitored_file_count = baseline_files + len(active_new_file_paths)
         file_alerted_count = min(
-            baseline_files, len(alerted_file_paths) + file_alerts_without_path
+            monitored_file_count,
+            len(alerted_file_paths) + file_alerts_without_path,
         )
-        clean_baseline_files = max(0, baseline_files - file_alerted_count)
+        clean_baseline_files = max(0, monitored_file_count - file_alerted_count)
         windows_worker = self.services.endpoint_service.workers.get(
             "windows-event-log"
         )
@@ -511,6 +523,8 @@ class DashboardPage(QWidget):
         process_worker_running = collector_is_fresh("process")
         network_worker_running = collector_is_fresh("network")
         file_worker_running = collector_is_fresh("file-integrity")
+        file_worker = self.services.endpoint_service.workers.get("file-integrity")
+        file_monitor_active = file_worker is not None and file_worker.isRunning()
         windows_worker_running = collector_is_fresh("windows-event-log")
         process_statistic = (
             f"{len(process_snapshot):,}/{process_count:,} processes"
@@ -526,27 +540,56 @@ class DashboardPage(QWidget):
             "waiting for a successful channel read"
         )
         files_score = (
-            _ratio_percent(clean_baseline_files, baseline_files)
-            if file_baseline_ready and file_worker_running and baseline_files > 0
+            _ratio_percent(clean_baseline_files, monitored_file_count)
+            if (
+                file_baseline_ready
+                and self.services.settings.file_integrity_monitoring_enabled
+                and monitored_file_count > 0
+            )
             else None
         )
-        identity_score = _ratio_percent(identity_passes, identity_attempts)
+        if not file_baseline_ready:
+            file_statistic = "No matching baseline"
+        elif file_worker_running:
+            file_statistic = (
+                f"{clean_baseline_files:,}/{monitored_file_count:,} files clear"
+            )
+        elif file_monitor_active:
+            file_statistic = (
+                f"{clean_baseline_files:,}/{monitored_file_count:,} clear · "
+                "initial scan pending"
+            )
+        else:
+            file_statistic = (
+                f"{clean_baseline_files:,}/{monitored_file_count:,} clear · "
+                "monitor not running"
+            )
+        identity_score_result = calculate_identity_security_score(
+            identity_events,
+            (
+                identity_profile.enrollment_quality
+                if identity_profile is not None
+                else None
+            ),
+            now=now_utc,
+            latest_successful_at=(
+                datetime.fromisoformat(str(latest_successful_verification["occurred_at"]))
+                if latest_successful_verification
+                and latest_successful_verification["occurred_at"]
+                else None
+            ),
+        )
+        identity_score = identity_score_result.score
         self.score_summary.set_factors(
             {
                 "Identity": (
                     identity_score,
-                    f"{identity_passes:,}/{identity_attempts:,} samples",
-                ),
-                "Files": (
-                    files_score,
                     (
-                        f"{clean_baseline_files:,}/{baseline_files:,} clean files"
-                        if file_worker_running
-                        else f"{baseline_files:,} baseline · monitor off"
-                    )
-                    if file_baseline_ready
-                    else "No matching baseline",
+                        f"{identity_score_result.measured_checks}/5 checks · "
+                        f"{identity_score_result.measured_weight}% weight measured"
+                    ),
                 ),
+                "Files": (files_score, file_statistic),
                 "Processes": (
                     None,
                     process_statistic,
@@ -562,7 +605,27 @@ class DashboardPage(QWidget):
                     windows_statistic,
                     windows_worker_running,
                 ),
-            }
+            },
+            tooltips={
+                "Identity": (
+                    "Weighted identity-security score. Checks with real measurements "
+                    "are normalized over their combined weights; missing checks are "
+                    "excluded rather than treated as zero. Verification freshness "
+                    "decays linearly over 30 days; pending liveness checks are not "
+                    "counted as failures. Face-match quality is recent average "
+                    "confidence; liveness is the completed motion-check pass ratio; "
+                    "enrollment quality is captured-sample consistency; stability is "
+                    "the recent recognized-result ratio (requires two results).\n"
+                    + identity_score_result.details
+                ),
+                "Files": (
+                    "File-integrity score uses trusted baseline files plus active "
+                    "untrusted additions. Files with unresolved integrity alerts "
+                    "reduce the score. When monitoring has just been enabled, the "
+                    "baseline score is available while its first scan starts; current "
+                    "monitor status is shown separately."
+                ),
+            },
         )
         for name, tooltip in {
             "Identity": (

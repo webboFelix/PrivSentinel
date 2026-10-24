@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime
@@ -45,17 +47,30 @@ from PySide6.QtWidgets import (
 )
 
 from src.app.dependencies import ApplicationServices
+from src.endpoint.integrity_baseline import ScanCancelledError
 from src.ui.components.data_table import DataTable
 from src.ui.components.status_indicator import StatusIndicator
 from src.ui.dialogs.confirmation_dialog import ConfirmationDialog
 from src.ui.icon_assets import icon_path
 
 _LOGGER = logging.getLogger(__name__)
+_SUGGESTED_EXCLUSIONS = (
+    "**/.git/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/Temp/**",
+    "**/Caches/**",
+    "*.pyc",
+    "*.tmp",
+)
 
 
 class _BaselineWorker(QThread):
     baselineCreated = Signal(int)
     baselineFailed = Signal(str)
+    baselineCancelled = Signal()
     progressChanged = Signal(int, int)
 
     def __init__(
@@ -69,6 +84,7 @@ class _BaselineWorker(QThread):
         self.services = services
         self.roots = roots
         self.exclusions = exclusions
+        self.cancel_event = threading.Event()
 
     def run(self) -> None:
         try:
@@ -76,7 +92,11 @@ class _BaselineWorker(QThread):
                 self.roots,
                 self.exclusions,
                 progress_details_callback=self.progressChanged.emit,
+                cancel_event=self.cancel_event,
             )
+        except ScanCancelledError:
+            self.baselineCancelled.emit()
+            return
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.baselineFailed.emit(str(exc))
             return
@@ -86,23 +106,40 @@ class _BaselineWorker(QThread):
             return
         self.baselineCreated.emit(count)
 
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
 
 class _VerifyWorker(QThread):
     completed = Signal(int)
     failed = Signal(str)
+    cancelled = Signal()
+    progressChanged = Signal(int, int)
 
     def __init__(self, services: ApplicationServices, parent: QWidget) -> None:
         super().__init__(parent)
         self.services = services
+        self.cancel_event = threading.Event()
 
     def run(self) -> None:
         try:
-            self.completed.emit(self.services.endpoint_service.verify_file_integrity())
+            self.completed.emit(
+                self.services.endpoint_service.verify_file_integrity(
+                    progress_details_callback=self.progressChanged.emit,
+                    cancel_event=self.cancel_event,
+                )
+            )
+        except ScanCancelledError:
+            self.cancelled.emit()
+            return
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
             _LOGGER.exception("Unexpected error during file-integrity verification")
             self.failed.emit(f"Unexpected {type(exc).__name__}: {exc}")
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
 
 
 class _EvidenceWorker(QThread):
@@ -130,10 +167,13 @@ class _EvidenceWorker(QThread):
 
 
 class FileIntegrityPage(QWidget):
+    BASELINE_TABLE_LIMIT = 500
+
     actionRequested = Signal(str)
     pageRequested = Signal(str)
     baselineProgressChanged = Signal(int, int)
     baselineSetupFinished = Signal(bool, str)
+    securityEventReceived = Signal(object)
 
     def __init__(
         self,
@@ -142,6 +182,13 @@ class FileIntegrityPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self.services = services
+        self.securityEventReceived.connect(
+            self._on_security_event,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._unsubscribe_event_bus = services.event_pipeline.bus.subscribe(
+            self._forward_security_event
+        )
         self._baseline_worker: _BaselineWorker | None = None
         self._verify_worker: _VerifyWorker | None = None
         self._evidence_worker: _EvidenceWorker | None = None
@@ -149,6 +196,7 @@ class FileIntegrityPage(QWidget):
         self._baseline_started_at: float | None = None
         self._baseline_progress_count = 0
         self._baseline_total_count = -1
+        self._folder_count_labels: dict[str, QLabel] = {}
         self._baseline_was_existing = False
         self._row_path_by_id: dict[str, str] = {}
         self._rendered_roots: tuple[str, ...] | None = None
@@ -187,7 +235,13 @@ class FileIntegrityPage(QWidget):
         self.baseline_progress.setTextVisible(True)
         self.baseline_progress.setFormat("Hashing files: %v / %m")
         self.baseline_progress.hide()
-        layout.addWidget(self.baseline_progress)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.baseline_progress, 1)
+        self.cancel_scan_button = QPushButton("Cancel Scan")
+        self.cancel_scan_button.clicked.connect(self.cancel_active_scan)
+        self.cancel_scan_button.hide()
+        progress_row.addWidget(self.cancel_scan_button)
+        layout.addLayout(progress_row)
 
         content = QGridLayout()
         content.setContentsMargins(0, 3, 0, 0)
@@ -516,10 +570,11 @@ class FileIntegrityPage(QWidget):
         table.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
     def _build_folder_rows(self) -> None:
-        roots = self.services.settings.file_integrity_roots
+        roots = self._unique_roots(self.services.settings.file_integrity_roots)
         if roots == self._rendered_roots:
             return
         self._rendered_roots = roots
+        self._folder_count_labels.clear()
         while self.protected_folder_layout.count():
             item = self.protected_folder_layout.takeAt(0)
             widget = item.widget()
@@ -546,6 +601,12 @@ class FileIntegrityPage(QWidget):
             path.setToolTip(root)
             text_layout.addWidget(name)
             text_layout.addWidget(path)
+            file_count = QLabel("Not scanned")
+            file_count.setObjectName("fimFolderCount")
+            file_count.setMinimumWidth(84)
+            file_count.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            file_count.setToolTip("No completed FIM scan is recorded for this folder yet.")
+            self._folder_count_labels[root] = file_count
             monitored = QLabel("Monitored")
             monitored.setObjectName("fimMonitoredPill")
             folder_menu_button = QPushButton("⋯")
@@ -558,6 +619,7 @@ class FileIntegrityPage(QWidget):
             )
             row.addWidget(icon)
             row.addLayout(text_layout, 1)
+            row.addWidget(file_count)
             row.addWidget(monitored)
             row.addWidget(folder_menu_button)
             folder_widget = QWidget()
@@ -569,7 +631,6 @@ class FileIntegrityPage(QWidget):
                 divider.setObjectName("fimDivider")
                 divider.setFixedHeight(1)
                 self.protected_folder_layout.addWidget(divider)
-
             monitored = QCheckBox(Path(root).name or root)
             monitored.setObjectName("fimFolderOption")
             monitored.setChecked(True)
@@ -593,6 +654,44 @@ class FileIntegrityPage(QWidget):
             settings_empty = QLabel("No protected folders configured.")
             settings_empty.setObjectName("muted")
             self.settings_folder_layout.addWidget(settings_empty)
+
+    def _update_folder_counts(
+        self,
+        roots: tuple[str, ...],
+        stats_rows: list[sqlite3.Row],
+        baseline_is_current: bool,
+    ) -> None:
+        if not baseline_is_current:
+            for root in roots:
+                label = self._folder_count_labels.get(root)
+                if label is not None:
+                    label.setText("Rescan needed")
+                    label.setToolTip(
+                        "Protected folders or exclusions differ from the saved "
+                        "baseline. Update the baseline to get current folder counts."
+                    )
+            return
+        stats = {
+            os.path.normcase(str(Path(row["root"]).resolve())): row
+            for row in stats_rows
+        }
+        for root in roots:
+            label = self._folder_count_labels.get(root)
+            if label is None:
+                continue
+            normalized_root = os.path.normcase(str(Path(root).expanduser().resolve()))
+            stats_row = stats.get(normalized_root)
+            if stats_row is not None:
+                count = int(stats_row["file_count"])
+                label.setText(f"{count:,} files")
+                label.setToolTip(
+                    "Current file count, refreshed on file-system changes and "
+                    "periodic reconciliation. Last update: "
+                    f"{self._format_event_time(str(stats_row['scanned_at']))}."
+                )
+                continue
+            label.setText("Not scanned")
+            label.setToolTip("No completed FIM scan count is recorded for this folder yet.")
 
     def _show_folder_menu(self, folder: str, button: QPushButton) -> None:
         menu = QMenu(self)
@@ -997,6 +1096,10 @@ class FileIntegrityPage(QWidget):
             ("File", "SHA-256", "Last Approved", "Size"),
             empty_message="The initial trusted baseline will be created on first launch.",
         )
+        self.baseline_table_summary = QLabel()
+        self.baseline_table_summary.setObjectName("muted")
+        self.baseline_table_summary.setWordWrap(True)
+        layout.addWidget(self.baseline_table_summary)
         layout.addWidget(self.baseline_table, 1)
         approvals_title = QLabel("Approval History")
         approvals_title.setObjectName("sectionTitle")
@@ -1032,7 +1135,18 @@ class FileIntegrityPage(QWidget):
         )
         self.exclusions.setMaximumHeight(70)
         self.exclusions.setPlainText("\n".join(self.services.settings.file_integrity_exclusions))
-        form.addRow("Exclusions", self.exclusions)
+        exclusions_row = QVBoxLayout()
+        exclusions_row.addWidget(self.exclusions)
+        self.suggest_exclusions_button = QPushButton(
+            "Add suggested development/cache exclusions"
+        )
+        self.suggest_exclusions_button.setToolTip(
+            "Optional patterns for common generated folders and temporary files. "
+            "They are not enabled unless you add and save them."
+        )
+        self.suggest_exclusions_button.clicked.connect(self._add_suggested_exclusions)
+        exclusions_row.addWidget(self.suggest_exclusions_button)
+        form.addRow("Exclusions", exclusions_row)
         self.enabled = QPushButton()
         self.enabled.setCheckable(True)
         self.enabled.setChecked(self.services.settings.file_integrity_monitoring_enabled)
@@ -1099,11 +1213,46 @@ class FileIntegrityPage(QWidget):
         return card
 
     def _roots(self) -> tuple[str, ...]:
-        return tuple(line.strip() for line in self.roots.toPlainText().splitlines() if line.strip())
+        return self._unique_roots(
+            tuple(
+                line.strip()
+                for line in self.roots.toPlainText().splitlines()
+                if line.strip()
+            )
+        )
+
+    @staticmethod
+    def _unique_roots(roots: tuple[str, ...]) -> tuple[str, ...]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = os.path.normcase(str(Path(root).expanduser().resolve()))
+            if key not in seen:
+                seen.add(key)
+                unique.append(root)
+        return tuple(unique)
 
     def _exclusions(self) -> tuple[str, ...]:
         return tuple(
             line.strip() for line in self.exclusions.toPlainText().splitlines() if line.strip()
+        )
+
+    def _add_suggested_exclusions(self) -> None:
+        current = list(self._exclusions())
+        existing = {pattern.casefold() for pattern in current}
+        additions = [
+            pattern
+            for pattern in _SUGGESTED_EXCLUSIONS
+            if pattern.casefold() not in existing
+        ]
+        if not additions:
+            self._set_status("Suggested exclusion patterns are already listed", "info")
+            return
+        self.exclusions.setPlainText("\n".join((*current, *additions)))
+        self._set_status(
+            "Suggested patterns added for review; save configuration to apply them. "
+            "Excluded files will not be monitored.",
+            "warning",
         )
 
     def _add_folder(self) -> None:
@@ -1242,10 +1391,14 @@ class FileIntegrityPage(QWidget):
         self._set_status("Hashing files for trusted baseline…", "info")
         self.status.show()
         self.baseline_progress.show()
+        self.cancel_scan_button.setText("Cancel Scan")
+        self.cancel_scan_button.setEnabled(True)
+        self.cancel_scan_button.show()
         worker = _BaselineWorker(self.services, roots, self._exclusions(), self)
         self._baseline_worker = worker
         worker.baselineCreated.connect(self._on_baseline_created)
         worker.baselineFailed.connect(self._on_baseline_failed)
+        worker.baselineCancelled.connect(self._on_baseline_cancelled)
         worker.progressChanged.connect(self._on_baseline_progress)
         worker.finished.connect(self._on_baseline_finished)
         self._refresh_baseline_progress()
@@ -1256,17 +1409,25 @@ class FileIntegrityPage(QWidget):
         self._baseline_progress_count = count
         self._baseline_total_count = total
         self.baselineProgressChanged.emit(count, total)
+        self._update_scan_progress_widget(count, total)
+
+    def _on_verification_progress(self, count: int, total: int) -> None:
+        self._baseline_progress_count = count
+        self._baseline_total_count = total
+        self._update_scan_progress_widget(count, total)
+
+    def _update_scan_progress_widget(self, count: int, total: int) -> None:
         if total < 0:
             self.baseline_progress.setRange(0, 0)
-            self.baseline_progress.setFormat("Counting files to hash…")
+            self.baseline_progress.setFormat("Finding files to scan…")
         elif total == 0:
             self.baseline_progress.setRange(0, 1)
             self.baseline_progress.setValue(1)
-            self.baseline_progress.setFormat("No files found; saving empty baseline")
+            self.baseline_progress.setFormat("No files found")
         else:
             self.baseline_progress.setRange(0, total)
             self.baseline_progress.setValue(count)
-            self.baseline_progress.setFormat("Hashing files: %v / %m")
+            self.baseline_progress.setFormat("Scanning files: %v / %m")
         self._refresh_baseline_progress()
 
     def _refresh_baseline_progress(self) -> None:
@@ -1274,13 +1435,24 @@ class FileIntegrityPage(QWidget):
             return
         elapsed = int(time.monotonic() - self._baseline_started_at)
         if self._baseline_total_count < 0:
-            text = f"Finding files to hash… {elapsed:,} sec"
+            text = f"Finding files to scan… {elapsed:,} sec"
         else:
             text = (
-                f"Hashing files… {self._baseline_progress_count:,} of "
+                f"Scanning files… {self._baseline_progress_count:,} of "
                 f"{self._baseline_total_count:,} · {elapsed:,} sec"
             )
         self._set_status(text, "info")
+
+    def cancel_active_scan(self) -> None:
+        worker = self._baseline_worker
+        if worker is None or not worker.isRunning():
+            worker = self._verify_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self.cancel_scan_button.setEnabled(False)
+        self.cancel_scan_button.setText("Cancelling…")
+        self._set_status("Cancelling the file-integrity scan…", "warning")
 
     def _on_baseline_created(self, count: int) -> None:
         self._baseline_status_timer.stop()
@@ -1333,10 +1505,24 @@ class FileIntegrityPage(QWidget):
         self._set_status(detail, "error")
         self.baselineSetupFinished.emit(False, detail)
 
+    def _on_baseline_cancelled(self) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
+        self.enabled.setChecked(False)
+        self._update_monitoring_label()
+        self.refresh_data()
+        message = (
+            "Baseline scan cancelled. No partial baseline was saved; monitoring "
+            "remains off."
+        )
+        self._set_status(message, "warning")
+        self.baselineSetupFinished.emit(False, message)
+
     def _on_baseline_finished(self) -> None:
         self._baseline_status_timer.stop()
         self._baseline_started_at = None
         self.baseline_progress.hide()
+        self.cancel_scan_button.hide()
         self._set_controls_enabled(True)
         self._baseline_worker = None
 
@@ -1350,35 +1536,66 @@ class FileIntegrityPage(QWidget):
             self.baseline_button,
             self.baseline_update_button,
             self.verify_button,
+            self.suggest_exclusions_button,
         ):
             widget.setEnabled(enabled)
 
     def verify_now(self) -> None:
+        if self._baseline_worker is not None and self._baseline_worker.isRunning():
+            return
         if self._verify_worker is not None and self._verify_worker.isRunning():
             return
         if not self.services.endpoint_service.has_file_baseline():
             self._set_status("Create or update a trusted baseline before verifying", "warning")
             return
         self.verify_button.setEnabled(False)
+        self._baseline_started_at = time.monotonic()
+        self._baseline_progress_count = 0
+        self._baseline_total_count = -1
+        self.baseline_progress.setRange(0, 0)
+        self.baseline_progress.setFormat("Finding files to verify…")
+        self.baseline_progress.show()
+        self.cancel_scan_button.setText("Cancel Scan")
+        self.cancel_scan_button.setEnabled(True)
+        self.cancel_scan_button.show()
+        self._baseline_status_timer.start()
+        self._set_controls_enabled(False)
         worker = _VerifyWorker(self.services, self)
         self._verify_worker = worker
         worker.completed.connect(self._on_verify_completed)
         worker.failed.connect(self._on_verify_failed)
+        worker.cancelled.connect(self._on_verify_cancelled)
+        worker.progressChanged.connect(self._on_verification_progress)
         worker.finished.connect(self._on_verify_finished)
         worker.start()
         self._set_status("Verifying protected files with SHA-256…", "info")
 
     def _on_verify_completed(self, count: int) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
         self._set_status(
             f"Verification complete · {count:,} new finding(s)", "warning" if count else "success"
         )
         self.refresh_data()
 
     def _on_verify_failed(self, message: str) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
         self._set_status(f"Verification failed: {message}", "error")
+
+    def _on_verify_cancelled(self) -> None:
+        self._baseline_status_timer.stop()
+        self._baseline_started_at = None
+        self._set_status(
+            "Verification cancelled. No partial scan results were saved.",
+            "warning",
+        )
 
     def _on_verify_finished(self) -> None:
         self.verify_button.setEnabled(True)
+        self.baseline_progress.hide()
+        self.cancel_scan_button.hide()
+        self._set_controls_enabled(True)
         self._verify_worker = None
 
     def _selected_file_path(self) -> str | None:
@@ -1501,6 +1718,14 @@ class FileIntegrityPage(QWidget):
         self.evidence_button.setEnabled(True)
         self._evidence_worker = None
 
+    def _forward_security_event(self, event: object) -> None:
+        if getattr(event, "source", None) == "file-integrity":
+            self.securityEventReceived.emit(event)
+
+    def _on_security_event(self, event: object) -> None:
+        if getattr(event, "source", None) == "file-integrity":
+            self.refresh_data()
+
     def _has_any_baseline(self) -> bool:
         return (
             self.services.database.fetchone(
@@ -1519,7 +1744,16 @@ class FileIntegrityPage(QWidget):
     def refresh_data(self) -> None:
         try:
             baseline_rows = self.services.database.fetchall(
-                "SELECT path, sha256, size, captured_at FROM file_integrity_baselines ORDER BY path"
+                "SELECT path, sha256, size, captured_at "
+                "FROM file_integrity_baselines ORDER BY path LIMIT ?",
+                (self.BASELINE_TABLE_LIMIT,),
+            )
+            baseline_count = self.services.database.fetchone(
+                "SELECT COUNT(*) AS count, MAX(captured_at) AS latest "
+                "FROM file_integrity_baselines"
+            )
+            folder_stats = self.services.database.fetchall(
+                "SELECT root, file_count, scanned_at FROM file_integrity_folder_stats"
             )
             has_current_baseline = self._has_current_baseline(
                 self.services.settings.file_integrity_roots,
@@ -1537,6 +1771,9 @@ class FileIntegrityPage(QWidget):
             findings = self.services.database.fetchone(
                 "SELECT COUNT(*) AS count FROM file_integrity_findings"
             )
+            inventory_count = self.services.database.fetchone(
+                "SELECT COUNT(*) AS count FROM file_integrity_inventory"
+            )
         except (OSError, ValueError, RuntimeError, sqlite3.Error, json.JSONDecodeError) as exc:
             self.table.show_error(f"Could not load file-integrity data: {exc}")
             self._set_status(f"Local data unavailable: {exc}", "error")
@@ -1551,7 +1788,7 @@ class FileIntegrityPage(QWidget):
             file_name = Path(path).name or path
             folder = str(Path(path).parent)
             event_type = str(event["event_type"]).casefold()
-            if "delet" in event_type:
+            if "delet" in event_type or event_type == "file_missing":
                 display_type = "Deleted"
                 status_text = "Investigate"
                 details = "File no longer exists"
@@ -1559,7 +1796,11 @@ class FileIntegrityPage(QWidget):
                 display_type = "Modified"
                 status_text = "Review Required"
                 details = "Hash changed"
-            elif "new" in event_type or "creat" in event_type:
+            elif (
+                "new" in event_type
+                or "creat" in event_type
+                or event_type == "file_added"
+            ):
                 display_type = "New File"
                 status_text = "Review Required"
                 details = "New file detected"
@@ -1597,6 +1838,12 @@ class FileIntegrityPage(QWidget):
             ],
             [str(row["path"]) for row in baseline_rows],
         )
+        total_baseline_count = int(baseline_count["count"]) if baseline_count else 0
+        self.baseline_table_summary.setText(
+            f"Showing {len(baseline_rows):,} of {total_baseline_count:,} trusted files."
+            if total_baseline_count > len(baseline_rows)
+            else f"{total_baseline_count:,} trusted files."
+        )
         self.approvals_table.set_rows(
             [
                 (
@@ -1615,11 +1862,18 @@ class FileIntegrityPage(QWidget):
             attributes = json.loads(row["attributes_json"])
             path = str(attributes.get("path", "Unknown file"))
             self._row_path_by_id[str(row["id"])] = path
+            event_type = str(row["event_type"]).casefold()
+            display_type = {
+                "file_added": "New File",
+                "file_changed": "Modified",
+                "file_missing": "Deleted",
+                "file_renamed": "Renamed",
+            }.get(event_type, event_type.replace("_", " ").title())
             history.append(
                 (
                     self._format_event_time(str(row["occurred_at"])),
                     Path(path).name,
-                    str(row["event_type"]).replace("_", " ").title(),
+                    display_type,
                     str(row["severity"]).title(),
                     str(row["description"]),
                 )
@@ -1628,28 +1882,40 @@ class FileIntegrityPage(QWidget):
         self.events_table.set_rows(history, history_ids)
 
         settings = self.services.settings
-        roots = settings.file_integrity_roots
+        roots = self._unique_roots(settings.file_integrity_roots)
         self.automatic_updates.blockSignals(True)
         self.automatic_updates.setChecked(settings.file_integrity_auto_update_enabled)
         self.automatic_updates.blockSignals(False)
         self.update_frequency.setEnabled(settings.file_integrity_auto_update_enabled)
         self.protected_count.value_label.setText(str(len(roots)))
         self.protected_count.description_label.setText("Folders monitored")
+        self._update_folder_counts(
+            roots,
+            folder_stats,
+            has_current_baseline,
+        )
         finding_count = int(findings["count"]) if findings else 0
-        self.tracked_count.value_label.setText(f"{len(baseline_rows) + finding_count:,}")
+        current_file_count = int(inventory_count["count"]) if inventory_count else 0
+        self.tracked_count.value_label.setText(f"{current_file_count:,}")
         self.tracked_count.description_label.setText(
-            f"{len(baseline_rows):,} trusted · {finding_count:,} new"
+            f"Current files · {finding_count:,} unresolved change(s)"
         )
         self.violation_count.value_label.setText(str(finding_count))
         self.violation_count.description_label.setText(
             "No recent violations" if not finding_count else "Review required"
         )
-        running = self._is_running()
+        worker = self.services.endpoint_service.workers.get("file-integrity")
+        running = worker is not None and worker.isRunning()
+        ready = running and worker.last_successful_collection_at is not None
         self.monitoring_count.value_label.setText(
-            '<span style="color:#28ce91">●</span> Active' if running else "Inactive"
+            '<span style="color:#28ce91">●</span> Active'
+            if ready
+            else "Starting" if running else "Inactive"
         )
         self.monitoring_count.description_label.setText(
-            "Watching for changes" if running else "Monitoring paused"
+            "Watching for changes"
+            if ready
+            else "Starting file-system watcher" if running else "Monitoring paused"
         )
         self.folder_summary.setText(
             "These folders are monitored for file integrity changes."
@@ -1657,7 +1923,11 @@ class FileIntegrityPage(QWidget):
             else "No protected folders configured. Add folders in Settings."
         )
         self._build_folder_rows()
-        latest_baseline = max((str(row["captured_at"]) for row in baseline_rows), default=None)
+        latest_baseline = (
+            str(baseline_count["latest"])
+            if baseline_count is not None and baseline_count["latest"]
+            else None
+        )
         last_updated = (
             self._format_event_time(latest_baseline) if latest_baseline else "Not yet created"
         )
@@ -1677,7 +1947,7 @@ class FileIntegrityPage(QWidget):
         if worker is None or not worker.isRunning():
             if has_current_baseline:
                 self._set_status(
-                    f"{len(baseline_rows):,} baseline files · "
+                    f"{total_baseline_count:,} baseline files · "
                     f"{finding_count:,} unresolved change(s)",
                     "success" if finding_count == 0 else "warning",
                 )
@@ -1752,7 +2022,9 @@ class FileIntegrityPage(QWidget):
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)
         settings = self.services.settings
-        self.roots.setPlainText("\n".join(settings.file_integrity_roots))
+        self.roots.setPlainText(
+            "\n".join(self._unique_roots(settings.file_integrity_roots))
+        )
         self.exclusions.setPlainText("\n".join(settings.file_integrity_exclusions))
         self.enabled.setChecked(settings.file_integrity_monitoring_enabled)
         self._update_monitoring_label()
@@ -1766,19 +2038,18 @@ class FileIntegrityPage(QWidget):
 
     def closeEvent(self, event: QEvent) -> None:
         self.stop_workers()
+        self._unsubscribe_event_bus()
         super().closeEvent(event)
 
     def stop_workers(self) -> None:
         worker = self._baseline_worker
         if worker is not None and worker.isRunning():
+            worker.cancel()
             worker.wait()
         verify_worker = self._verify_worker
         if verify_worker is not None and verify_worker.isRunning():
+            verify_worker.cancel()
             verify_worker.wait()
         evidence_worker = self._evidence_worker
         if evidence_worker is not None and evidence_worker.isRunning():
             evidence_worker.wait()
-
-    def _is_running(self) -> bool:
-        worker = self.services.endpoint_service.workers.get("file-integrity")
-        return worker is not None and worker.isRunning()

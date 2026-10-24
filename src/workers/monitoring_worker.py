@@ -19,12 +19,12 @@ class MonitoringWorker(QThread):
         self,
         source_name: str,
         collector,
-        interval_seconds: int,
+        interval_seconds: float,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        if not 1 <= interval_seconds <= 3600:
-            raise ValueError("Polling interval must be between 1 and 3600 seconds.")
+        if not 0.05 <= interval_seconds <= 3600:
+            raise ValueError("Polling interval must be between 0.05 and 3600 seconds.")
         self.source_name = source_name
         self.collector = collector
         self.interval_seconds = interval_seconds

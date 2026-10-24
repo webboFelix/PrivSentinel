@@ -1,5 +1,7 @@
 import base64
 import socket
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import Mock
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import QCheckBox, QGridLayout, QLabel, QMessageBox
 from src.app.dependencies import ApplicationServices
 from src.config.paths import AppPaths
 from src.core.event_models import SecurityEvent
+from src.endpoint.integrity_baseline import ScanCancelledError
 from src.endpoint.process_monitor import ProcessSnapshot
 from src.storage.models import IdentityEvent
 from src.ui.components.search_bar import SearchBar
@@ -379,7 +382,7 @@ def test_dashboard_summary_cards_show_only_persisted_or_configured_values(window
 
     assert dashboard.files_summary.count_label.text() == "1"
     assert dashboard.files_summary.changes_label.text() == "Recorded changes  1"
-    assert dashboard.files_summary.suspicious_label.text() == "Unresolved file alerts  0"
+    assert dashboard.files_summary.suspicious_label.text() == "Unresolved file alerts  1"
     assert dashboard.files_summary.quarantined_label.text() == "Quarantined  —"
 
 
@@ -435,6 +438,41 @@ def test_dashboard_score_card_reports_only_available_measured_ratios(window):
         "Network": "Active",
         "Windows": "Active",
     }
+
+
+def test_dashboard_files_score_is_available_when_monitoring_is_enabled(window, tmp_path):
+    watched = tmp_path / "dashboard-fim"
+    watched.mkdir()
+    tracked = watched / "tracked.txt"
+    tracked.write_text("trusted", encoding="utf-8")
+    roots = (str(watched),)
+    window.services.save_settings(
+        replace(
+            window.services.settings,
+            file_integrity_roots=roots,
+            file_integrity_monitoring_enabled=False,
+        )
+    )
+    window.services.endpoint_service.establish_file_baseline()
+    window.services.save_settings(
+        replace(
+            window.services.settings,
+            file_integrity_monitoring_enabled=True,
+        )
+    )
+    dashboard = window._pages["dashboard"]
+
+    try:
+        dashboard.refresh_security_data()
+        assert dashboard.score_summary.factor_values["Files"].text() == "100%"
+
+        window.services.endpoint_service.stop("file-integrity")
+        tracked.unlink()
+        assert window.services.endpoint_service.verify_file_integrity() == 1
+        dashboard.refresh_security_data()
+        assert dashboard.score_summary.factor_values["Files"].text() == "0%"
+    finally:
+        window.services.endpoint_service.stop("file-integrity")
 
 
 def test_dashboard_scan_action_opens_real_malware_scan_workflow(window):
@@ -770,6 +808,197 @@ def test_file_integrity_page_creates_baseline_and_syncs_configuration(qtbot, win
     window.navigate_to("settings")
     settings = window._pages["settings"]
     assert settings.file_integrity_roots.toPlainText() == str(watched)
+
+
+def test_file_integrity_deletion_is_visible_in_recent_events(window, tmp_path):
+    page = window._pages["file-integrity"]
+    watched = tmp_path / "fim-delete"
+    watched.mkdir()
+    tracked = watched / "remove-me.txt"
+    tracked.write_text("trusted", encoding="utf-8")
+    page.roots.setPlainText(str(watched))
+    page._save_configuration()
+    window.services.endpoint_service.establish_file_baseline()
+    tracked.unlink()
+
+    assert window.services.endpoint_service.verify_file_integrity() == 1
+    page.refresh_data()
+
+    assert page.table.rows[0][1].splitlines()[0] == "remove-me.txt"
+    assert page.table.rows[0][2] == "Deleted"
+    assert page.table.rows[0][3] == "Investigate"
+
+
+def test_live_file_operations_refresh_fim_events_without_manual_refresh(
+    qtbot, window, tmp_path
+):
+    page = window._pages["file-integrity"]
+    watched = tmp_path / "live-fim"
+    watched.mkdir()
+    modified = watched / "modify.txt"
+    rename_source = watched / "rename-source.txt"
+    deleted = watched / "delete.txt"
+    modified.write_text("original", encoding="utf-8")
+    rename_source.write_text("rename me", encoding="utf-8")
+    deleted.write_text("delete me", encoding="utf-8")
+    page.roots.setPlainText(str(watched))
+    page._save_configuration()
+    window.services.endpoint_service.establish_file_baseline()
+    window.services.save_settings(
+        replace(
+            window.services.settings,
+            file_integrity_monitoring_enabled=True,
+        )
+    )
+    worker = window.services.endpoint_service.workers["file-integrity"]
+    qtbot.waitUntil(
+        lambda: worker.last_successful_collection_at is not None,
+        timeout=10_000,
+    )
+
+    def wait_for_event_type(event_type: str, status: str) -> None:
+        qtbot.waitUntil(
+            lambda: any(
+                row[2] == event_type and row[3] == status
+                for row in page.table.rows
+            ),
+            timeout=10_000,
+        )
+
+    try:
+        delivered_events = []
+        service_errors = []
+        page.securityEventReceived.connect(delivered_events.append)
+        window.services.endpoint_service.serviceError.connect(service_errors.append)
+        folder_label = next(iter(page._folder_count_labels.values()))
+        created = watched / "new.txt"
+        created.write_text("new file", encoding="utf-8")
+        qtbot.waitUntil(
+            lambda: bool(delivered_events) or bool(service_errors),
+            timeout=10_000,
+        )
+        assert not service_errors, service_errors
+        assert delivered_events[0].event_type == "file_added"
+        wait_for_event_type("New File", "Review Required")
+        qtbot.waitUntil(
+            lambda: folder_label.text() == "4 files",
+            timeout=5_000,
+        )
+        assert page.tracked_count.value_label.text() == "4"
+
+        modified.write_text("modified content", encoding="utf-8")
+        wait_for_event_type("Modified", "Review Required")
+        assert folder_label.text() == "4 files"
+
+        rename_source.rename(watched / "rename-target.txt")
+        wait_for_event_type("Renamed", "Review Required")
+        assert folder_label.text() == "4 files"
+
+        deleted.unlink()
+        wait_for_event_type("Deleted", "Investigate")
+        qtbot.waitUntil(
+            lambda: folder_label.text() == "3 files",
+            timeout=5_000,
+        )
+        assert page.tracked_count.value_label.text() == "3"
+    finally:
+        window.services.endpoint_service.stop("file-integrity")
+
+
+def test_fim_folder_count_and_suggested_exclusions_are_explicit(window, tmp_path):
+    page = window._pages["file-integrity"]
+    watched = tmp_path / "fim-count"
+    watched.mkdir()
+    (watched / "one.txt").write_text("one", encoding="utf-8")
+    (watched / "two.txt").write_text("two", encoding="utf-8")
+    page.roots.setPlainText(str(watched))
+    page._save_configuration()
+    window.services.endpoint_service.establish_file_baseline()
+    page.refresh_data()
+
+    assert page._folder_count_labels[str(watched)].text() == "2 files"
+    assert window.services.settings.file_integrity_exclusions == ()
+
+    page.suggest_exclusions_button.click()
+
+    assert "**/.git/**" in page.exclusions.toPlainText().splitlines()
+    assert window.services.settings.file_integrity_exclusions == ()
+
+
+def test_fim_baseline_table_limits_rendering_for_large_baselines(window):
+    with window.services.database.transaction() as connection:
+        connection.executemany(
+            "INSERT INTO file_integrity_baselines "
+            "(path, sha256, modified_ns, size, captured_at) VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    f"C:\\protected\\file-{index:04}.txt",
+                    f"{index:064x}",
+                    1,
+                    10,
+                    "2026-10-24T00:00:00+00:00",
+                )
+                for index in range(501)
+            ],
+        )
+
+    page = window._pages["file-integrity"]
+    page.refresh_data()
+
+    assert len(page.baseline_table.rows) == 500
+    assert page.baseline_table_summary.text() == "Showing 500 of 501 trusted files."
+
+
+def test_fim_folder_settings_rows_do_not_repeat_on_refresh(window, tmp_path):
+    page = window._pages["file-integrity"]
+    folders = tuple(tmp_path / name for name in ("Documents", "Downloads", "Desktop"))
+    roots = tuple(str(folder) for folder in folders)
+    for folder in folders:
+        folder.mkdir()
+    page.roots.setPlainText("\n".join(roots))
+    page._save_configuration()
+
+    for _ in range(5):
+        page.refresh_data()
+
+    assert page.protected_folder_layout.count() == 5
+    assert page.settings_folder_layout.count() == 3
+
+
+def test_fim_baseline_scan_can_be_cancelled_from_the_page(qtbot, window, tmp_path, monkeypatch):
+    page = window._pages["file-integrity"]
+    watched = tmp_path / "fim-cancel"
+    watched.mkdir()
+    page.roots.setPlainText(str(watched))
+    entered = threading.Event()
+
+    def wait_for_cancel(
+        roots,
+        exclusions,
+        progress_callback=None,
+        progress_details_callback=None,
+        cancel_event=None,
+    ):
+        entered.set()
+        if progress_details_callback is not None:
+            progress_details_callback(-1, -1)
+        while cancel_event is not None and not cancel_event.wait(0.01):
+            time.sleep(0.01)
+        raise ScanCancelledError("File-integrity scan was cancelled.")
+
+    monkeypatch.setattr(
+        window.services.endpoint_service,
+        "establish_file_baseline",
+        wait_for_cancel,
+    )
+
+    page.start_baseline()
+    qtbot.waitUntil(entered.is_set, timeout=5_000)
+    assert not page.cancel_scan_button.isHidden()
+    page.cancel_scan_button.click()
+    qtbot.waitUntil(lambda: page._baseline_worker is None, timeout=5_000)
+
+    assert "scan cancelled" in page.status.text_label.text().casefold()
 
 
 def test_file_integrity_reference_dashboard_tabs_and_auto_update_setting(qtbot, window, tmp_path):

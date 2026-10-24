@@ -938,6 +938,7 @@ class EnrollmentDialog(QDialog):
                     "phone": self.phone.text(),
                     "profile_image": self._profile_image_data,
                 },
+                enrollment_quality=consistency,
             )
         except (OSError, TypeError, ValueError, RuntimeError, sqlite3.Error) as exc:
             self._enrollment_failed(str(exc))

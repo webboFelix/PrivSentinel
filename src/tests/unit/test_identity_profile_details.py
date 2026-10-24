@@ -1,4 +1,5 @@
 import base64
+import sqlite3
 from datetime import UTC, datetime
 from io import BytesIO
 
@@ -44,6 +45,7 @@ def test_optional_enrollment_details_are_loaded_from_secret_store(tmp_path):
             "employee_id": "E-123",
             "machine_user": "ada",
         },
+        enrollment_quality=0.91,
     )
 
     assert profile.email == "ada@example.com"
@@ -54,6 +56,7 @@ def test_optional_enrollment_details_are_loaded_from_secret_store(tmp_path):
     assert profile.department == "Research"
     assert profile.employee_id == "E-123"
     assert profile.machine_user == "ada"
+    assert profile.enrollment_quality == 0.91
     assert repository.profile() == profile
     assert repository.templates().shape == (1, 32)
     assert "identity-profile" in secrets.values
@@ -162,3 +165,27 @@ def test_deleting_enrollment_removes_protected_profile_details(tmp_path):
 
     assert repository.delete_profile()
     assert secrets.values == {}
+
+
+def test_existing_identity_profile_schema_is_migrated(tmp_path):
+    database_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE identity_profile (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                display_name TEXT NOT NULL,
+                enrolled_at TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                template_dimensions INTEGER NOT NULL,
+                consent_recorded_at TEXT NOT NULL
+            )
+            """
+        )
+
+    database = SQLiteDatabase(database_path)
+
+    columns = {
+        row["name"] for row in database.fetchall("PRAGMA table_info(identity_profile)")
+    }
+    assert "enrollment_quality" in columns

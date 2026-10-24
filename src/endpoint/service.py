@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -77,7 +78,11 @@ class EndpointMonitoringService(QObject):
         worker = MonitoringWorker(
             source,
             collector,
-            1 if source == "file-integrity" else self.settings.endpoint_poll_interval_seconds,
+            (
+                0.2
+                if source == "file-integrity"
+                else self.settings.endpoint_poll_interval_seconds
+            ),
             self,
         )
         self.workers[source] = worker
@@ -108,6 +113,7 @@ class EndpointMonitoringService(QObject):
         exclusions: tuple[str, ...] | None = None,
         progress_callback: Callable[[int], None] | None = None,
         progress_details_callback: Callable[[int, int], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         monitor = FileIntegrityMonitor(
             self.database,
@@ -121,11 +127,13 @@ class EndpointMonitoringService(QObject):
                 progress_callback,
                 actor=actor,
                 progress_details_callback=progress_details_callback,
+                cancel_event=cancel_event,
             )
             if exists is not None
             else monitor.establish_baseline(
                 progress_callback,
                 progress_details_callback=progress_details_callback,
+                cancel_event=cancel_event,
             )
         )
         self.pipeline.repository.record_audit(
@@ -136,13 +144,21 @@ class EndpointMonitoringService(QObject):
         )
         return count
 
-    def verify_file_integrity(self) -> int:
+    def verify_file_integrity(
+        self,
+        progress_details_callback: Callable[[int, int], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
         monitor = FileIntegrityMonitor(
             self.database,
             self.settings.file_integrity_roots,
             self.settings.file_integrity_exclusions,
         )
-        events = monitor.scan()
+        events = monitor.scan(
+            progress_details_callback=progress_details_callback,
+            cancel_event=cancel_event,
+            force_full_verification=True,
+        )
         for event in events:
             self.pipeline.publish(event)
         actor = getpass.getuser()
@@ -213,11 +229,22 @@ class EndpointMonitoringService(QObject):
         )
         if config is None:
             return False
-        expected_roots = sorted(str(Path(root).expanduser().resolve()) for root in configured_roots)
-        baseline_roots = sorted(json.loads(config["roots_json"]))
+        expected_roots = sorted(
+            {
+                str(Path(root).expanduser().resolve()).casefold()
+                for root in configured_roots
+            }
+        )
+        baseline_roots = sorted(
+            {
+                str(Path(root).expanduser().resolve()).casefold()
+                for root in json.loads(config["roots_json"])
+            }
+        )
         baseline_exclusions = tuple(json.loads(config["exclusions_json"]))
         return (
-            expected_roots == baseline_roots and tuple(configured_exclusions) == baseline_exclusions
+            expected_roots == baseline_roots
+            and tuple(configured_exclusions) == baseline_exclusions
         )
 
     def _create_collector(self, source: str):

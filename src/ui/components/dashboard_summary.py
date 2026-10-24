@@ -616,6 +616,7 @@ class DashboardScoreCard(_SummaryCard):
     def set_factors(
         self,
         values: Mapping[str, tuple[int | None, str] | tuple[int | None, str, bool]],
+        tooltips: Mapping[str, str] | None = None,
     ) -> None:
         self.clear_error()
         coverage_scores = []
@@ -645,9 +646,11 @@ class DashboardScoreCard(_SummaryCard):
                 detail = f"{name}: {statistic}; measured value: {score}%."
             else:
                 detail = f"{name}: {statistic}; percentage unavailable."
-            label.setToolTip(detail)
-            self.factor_progress[name].setToolTip(detail)
-            self.factor_values[name].setToolTip(detail)
+            tooltip = (tooltips or {}).get(name, detail)
+            label.setToolTip(tooltip)
+            self.factor_progress[name].setToolTip(tooltip)
+            self.factor_values[name].setToolTip(tooltip)
+            self.factor_stats[name].setToolTip(tooltip)
             if indicator_active is None:
                 self.factor_values[name].setText(
                     f"{score}%" if score is not None else "N/A"
